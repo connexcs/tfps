@@ -9,6 +9,26 @@ parsing log files, so it reacts in packets rather than log-flush intervals, and 
 attacks the logs never record. As a side effect the banned traffic vanishes from your
 `sngrep`.
 
+> **About this fork.** This is ConnexCS's fork of [sippulse/tfps](https://github.com/sippulse/tfps).
+> The original is built for a single server and keeps its attack surface as small as possible.
+> We run hundreds of servers, so this fork adds fleet-scale integrations:
+>
+> - an optional JSON-over-HTTP API and Prometheus metrics endpoint
+> - optional HTTP webhooks on events
+> - optional HEP ingestion, so a proxy such as OpenSIPS can pass in WebRTC and TLS traffic
+>   that TFPS cannot read off the wire
+>
+> Each of these is **off by default**. With them off, the fork behaves like upstream. Each one
+> you turn on adds attack surface that a single-server install does not need, so if you run
+> one server, use the upstream project.
+>
+> We do not send these changes upstream by default, because they may not fit the original
+> project's goals. Upstream is welcome to take any of them, and we will open pull requests on
+> request.
+>
+> *AI disclosure:* plans are drafted with Claude Fable 5.2, code is written with Claude Opus 5.5,
+> reviews use GitHub Copilot, and a final security audit uses Codex.
+
 ## Install
 
 ```sh
