@@ -22,7 +22,7 @@ use serde::Serialize;
 use tfps::ctl::{
     action_doc, banned_docs, finite, log_docs, manual_attribution, manual_banned, manual_record,
     newest_audit_ts, now, record_manual, stats_docs, status_docs, unban_docs, ActionDoc, Ctx,
-    UnbanTarget,
+    UnbanOutcome, UnbanTarget,
 };
 use tfps::say;
 use tfps::store::{BlockRow, SourceFilter, Store};
@@ -520,17 +520,25 @@ fn unban(args: &Args) -> Result<(), String> {
     } else {
         UnbanTarget::Addresses(&args.positional)
     };
-    let docs = unban_docs(
+    let UnbanOutcome { docs, failed } = unban_docs(
         &args.ctx(),
         target,
         args.source.as_deref(),
         args.reason.as_deref(),
     )?;
+    // `--all` has only ever reported once every removal succeeded. The address
+    // form reports each address it handled, so on a kernel failure part-way
+    // through, the ones lifted before it are still printed ahead of the error.
+    if args.all {
+        if let Some(e) = failed {
+            return Err(e);
+        }
+    }
     if args.json {
         for doc in &docs {
             say!("{}", tfps::json_line(doc)?);
         }
-        return Ok(());
+        return failed.map_or(Ok(()), Err);
     }
     if args.all {
         say!("unbanned {} sources", docs.len());
@@ -546,7 +554,7 @@ fn unban(args: &Args) -> Result<(), String> {
             say!("{ip} was not blocked");
         }
     }
-    Ok(())
+    failed.map_or(Ok(()), Err)
 }
 
 /// Which entry exempted a hand-placed block, and where that entry came from.

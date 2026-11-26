@@ -199,12 +199,17 @@ pub enum UnbanTarget<'a> {
 /// list lifts nothing rather than lifting the addresses before it. And
 /// whatever was removed is recorded even when a later kernel write fails, so
 /// the record never misses an unban that took effect.
+///
+/// `Err` means nothing was touched: bad input, or a map that will not open.
+/// A kernel failure part-way through is not an `Err`: it is
+/// `UnbanOutcome::failed`, beside the documents for the addresses handled
+/// before it, so a caller can still say which blocks were lifted.
 pub fn unban_docs(
     ctx: &Ctx,
     target: UnbanTarget<'_>,
     source: Option<&str>,
     reason: Option<&str>,
-) -> Result<Vec<ActionDoc>, String> {
+) -> Result<UnbanOutcome, String> {
     let ips: Option<Vec<Ipv4Addr>> = match target {
         UnbanTarget::All => None,
         UnbanTarget::Addresses([]) => return Err("give at least one address, or --all".into()),
@@ -216,10 +221,7 @@ pub fn unban_docs(
     let ips = ips.unwrap_or_else(|| b.entries().into_iter().map(|(ip, _)| ip).collect());
     let (removed, failed) = remove_each(&ips, |ip| b.remove(ip));
     record_manual(ctx, &manual_unbans(&removed, source, reason, now()));
-    if let Some(e) = failed {
-        return Err(e);
-    }
-    Ok(removed
+    let docs = removed
         .iter()
         .map(|(ip, was_removed)| {
             let refused = if *was_removed {
@@ -229,7 +231,18 @@ pub fn unban_docs(
             };
             action_doc(Some(&ip.to_string()), "unban", refused, None).with_source(source)
         })
-        .collect())
+        .collect();
+    Ok(UnbanOutcome { docs, failed })
+}
+
+/// What `unban_docs` did once it reached the map.
+#[derive(Debug)]
+pub struct UnbanOutcome {
+    /// One per address handled, in order, up to any failure.
+    pub docs: Vec<ActionDoc>,
+    /// The kernel error that stopped it part-way, if one did. The addresses
+    /// after it were not attempted.
+    pub failed: Option<String>,
 }
 
 /// Every address in `raw`, or the first one that will not parse, named.
@@ -865,7 +878,7 @@ pub fn banned_attribution<'a>(
 /// before any per-address work, so an unparseable address aborts the whole
 /// command (not rendered as JSON at all) rather than ever reaching this
 /// document.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct ActionDoc {
     pub ip: Option<String>,
     pub action: String,
@@ -1993,11 +2006,13 @@ mod tests {
     fn unban_docs_records_what_it_did() {
         let body = fn_body("unban_docs");
         assert!(body.contains("record_manual("), "{body}");
-        // Recorded before the error is returned: the removals before a failed
-        // kernel write have happened and must not be missing from the record.
+        // Recorded unconditionally, after the removals and with no early
+        // return between: the removals before a failed kernel write have
+        // happened and must not be missing from the record.
+        let removed = body.find("remove_each(").expect("removes");
         let record = body.find("record_manual(").expect("records");
-        let fail = body.find("return Err(e)").expect("propagates the failure");
-        assert!(record < fail, "{body}");
+        assert!(removed < record, "{body}");
+        assert!(!body[removed..record].contains("return"), "{body}");
     }
 
     #[test]
@@ -2017,17 +2032,15 @@ mod tests {
     #[test]
     fn unban_docs_parses_every_address_before_touching_the_map() {
         let raw = ["203.0.113.1".to_string(), "203.0.113.x".to_string()];
-        let e = unban_docs(&nowhere(), UnbanTarget::Addresses(&raw), None, None)
-            .err()
-            .expect("refused");
+        let e =
+            unban_docs(&nowhere(), UnbanTarget::Addresses(&raw), None, None).expect_err("refused");
         assert!(e.starts_with("203.0.113.x: "), "{e}");
     }
 
     #[test]
     fn unban_docs_wants_an_address_or_all() {
-        let e = unban_docs(&nowhere(), UnbanTarget::Addresses(&[]), None, None)
-            .err()
-            .expect("refused");
+        let e =
+            unban_docs(&nowhere(), UnbanTarget::Addresses(&[]), None, None).expect_err("refused");
         assert_eq!(e, "give at least one address, or --all");
     }
 
