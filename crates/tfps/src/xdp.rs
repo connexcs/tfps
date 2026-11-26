@@ -13,7 +13,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapError};
 use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 
@@ -410,9 +410,15 @@ impl Blocklist {
 
     /// One address's entry: `Some(until)` when it is blocked (`0` = no expiry),
     /// `None` when it is not. A single key lookup, not a walk of the map.
-    pub fn get(&self, ip: Ipv4Addr) -> Option<u64> {
-        self.map.get(&self.key(ip), 0).ok()
+    ///
+    /// Only a missing key is `None`. Any other failure is an error, so an
+    /// unreadable map is never reported as "not blocked".
+    pub fn get(&self, ip: Ipv4Addr) -> Result<Option<u64>, String> {
+        lookup_result(self.map.get(&self.key(ip), 0), ip)
     }
+
+    // `remove` below keeps its own check: it predates `get` and its callers
+    // already distinguish its errors from "was not there".
 
     /// Lifts a block. Returns whether the address was there — an operator who typos an
     /// address must be told nothing happened, not left believing they unbanned someone.
@@ -510,9 +516,28 @@ pub fn default_interface() -> Option<String> {
     None
 }
 
+/// A map lookup's answer: the value, `None` for a key that is not there, and an
+/// error for anything else.
+fn lookup_result(r: Result<u64, MapError>, ip: Ipv4Addr) -> Result<Option<u64>, String> {
+    match r {
+        Ok(until) => Ok(Some(until)),
+        Err(MapError::KeyNotFound) => Ok(None),
+        Err(e) => Err(format!("reading the block map for {ip}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_missing_key_reads_as_not_blocked() {
+        let ip = Ipv4Addr::new(203, 0, 113, 1);
+        assert_eq!(lookup_result(Ok(0), ip), Ok(Some(0)));
+        assert_eq!(lookup_result(Err(MapError::KeyNotFound), ip), Ok(None));
+        let e = lookup_result(Err(MapError::ElementNotFound), ip).expect_err("an error");
+        assert!(e.contains("203.0.113.1"), "{e}");
+    }
 
     #[test]
     fn monotonic_is_readable_and_nonzero() {

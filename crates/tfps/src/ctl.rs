@@ -170,7 +170,7 @@ pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
 /// One key lookup in the map and lookups for that one address, not the whole
 /// listing: the same attribution as `banned_docs`, through the same function.
 pub fn banned_doc_for(ctx: &Ctx, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
-    let Some(until) = open_blocklist(ctx)?.get(ip) else {
+    let Some(until) = open_blocklist(ctx)?.get(ip)? else {
         return Ok(None);
     };
     Ok(attribute_entries(ctx, &[(ip, until)]).pop())
