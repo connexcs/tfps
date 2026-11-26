@@ -7,6 +7,7 @@
 //!
 //! The decision logic is not here: it lives in `tfps-core`, which does no I/O.
 
+pub mod api;
 pub mod apiban;
 pub mod config;
 pub mod ctl;

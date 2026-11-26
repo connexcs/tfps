@@ -22,11 +22,13 @@
 //!   "no_enforce_one_way": false,
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
-//!   "block_ttl": 3600
+//!   "block_ttl": 3600,
+//!   "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false }
 //! }
 //! ```
 
 use std::collections::BTreeMap;
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -124,6 +126,46 @@ pub struct Config {
     pub reapply_manual_bans: bool,
     pub xdp_obj: Option<PathBuf>,
     pub drop_map: Option<PathBuf>,
+    /// The optional JSON-over-HTTP API served by `tfps_ctl serve`. The daemon
+    /// itself ignores this section: the API is a separate process.
+    pub http: Option<HttpConfig>,
+}
+
+/// Where the default listener goes: loopback only, so nothing is reachable
+/// from the network until somebody decides it should be.
+pub const DEFAULT_HTTP_LISTEN: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9060);
+
+/// The `http` section: `tfps_ctl serve`'s listener.
+///
+/// **Off unless `enabled` is true**, and unbanning over HTTP is a second switch
+/// that is also off. There is no authentication in TFPS: anyone who can reach
+/// `listen` can read the blocks (and lift them, with `allow_unban`), so access
+/// beyond the local host is a reverse proxy's job.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// An IPv4 `address:port`. Default `127.0.0.1:9060`.
+    #[serde(default = "default_http_listen")]
+    pub listen: SocketAddrV4,
+    /// Accept `POST /v1/unban`. Off: that route answers 403.
+    #[serde(default)]
+    pub allow_unban: bool,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        HttpConfig {
+            enabled: false,
+            listen: DEFAULT_HTTP_LISTEN,
+            allow_unban: false,
+        }
+    }
+}
+
+fn default_http_listen() -> SocketAddrV4 {
+    DEFAULT_HTTP_LISTEN
 }
 
 /// The read result, so the configuration's origin shows up in the startup report. The
@@ -265,6 +307,50 @@ mod tests {
             Some(std::path::Path::new("/srv/tfps/manual"))
         );
         assert!(parse("{}").expect("empty").manual_log_dir.is_none());
+    }
+
+    #[test]
+    fn the_http_api_is_off_loopback_and_read_only_by_default() {
+        assert!(parse("{}").expect("empty").http.is_none());
+        let h = parse(r#"{"http": {}}"#)
+            .expect("parses")
+            .http
+            .expect("present");
+        assert_eq!(h, HttpConfig::default());
+        assert!(!h.enabled && !h.allow_unban);
+        assert_eq!(h.listen.to_string(), "127.0.0.1:9060");
+        let h =
+            parse(r#"{"http": {"enabled": true, "listen": "0.0.0.0:8080", "allow_unban": true}}"#)
+                .expect("parses")
+                .http
+                .expect("present");
+        assert!(h.enabled && h.allow_unban);
+        assert_eq!(h.listen.to_string(), "0.0.0.0:8080");
+    }
+
+    /// The file the installer writes when there is none must load. If it did
+    /// not, the daemon would run on built-in defaults while the operator edits a
+    /// file that is never applied.
+    #[test]
+    fn the_shipped_example_configuration_loads() {
+        let c = parse(include_str!("../../../packaging/config.example.json"))
+            .expect("packaging/config.example.json must parse");
+        assert_eq!(
+            c.http,
+            Some(HttpConfig::default()),
+            "shipped with the API off"
+        );
+    }
+
+    #[test]
+    fn the_http_section_refuses_typos_and_ipv6() {
+        let e = parse(r#"{"http": {"enable": true}}"#).unwrap_err();
+        assert!(e.contains("enable"), "{e}");
+        assert!(parse(r#"{"http": {"listen": "[::1]:9060"}}"#).is_err());
+        assert!(
+            parse(r#"{"http": {"listen": "127.0.0.1"}}"#).is_err(),
+            "a port is required"
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@ MUSL_TARGET="x86_64-unknown-linux-musl"
 BIN_DST=/usr/local/bin
 OBJ_DST=/usr/local/lib/tfps/tfps_xdp.o
 UNIT_DST=/etc/systemd/system/tfps.service
+API_UNIT_DST=/etc/systemd/system/tfps-api.service
 CONF_DST=/etc/tfps/config.json
 # A source build on a small box can starve the softswitch it is meant to protect.
 BUILD_MIN_MEM_MB=1500
@@ -201,6 +202,10 @@ install -D -m644 "$TMP/tfps_xdp.o" "$OBJ_DST"
 
 say "3/4 installing the unit and, only if absent, a starting configuration"
 install -D -m644 "$SRC/packaging/tfps.service" "$UNIT_DST"
+# The optional HTTP API's unit: installed, never enabled here. Older tarballs lack it.
+if [ -f "$SRC/packaging/tfps-api.service" ]; then
+    install -D -m644 "$SRC/packaging/tfps-api.service" "$API_UNIT_DST"
+fi
 [ -f "$CONF_DST" ] || install -D -m600 "$SRC/packaging/config.example.json" "$CONF_DST"
 
 say "4/4 starting"
@@ -219,3 +224,7 @@ fi
 say ""
 say "Watch it work:   journalctl -u tfps -f"
 say "Ask it what it knows:  tfps_ctl status"
+if systemctl -q is-active tfps-api 2>/dev/null; then
+    # An upgrade must not leave the old API binary answering.
+    systemctl restart tfps-api
+fi

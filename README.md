@@ -335,9 +335,14 @@ integrations. Never **policy** configuration, which would say what fraud is.
   "stats_every": 120,
   "checkpoint_every": 300,
   "iface": "eth0",
-  "db": "/var/lib/tfps/tfps.db"
+  "db": "/var/lib/tfps/tfps.db",
+
+  "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false }
 }
 ```
+
+`http` configures the optional JSON API (`tfps_ctl serve`); the daemon ignores it. See
+"JSON API" below.
 
 Precedence: **command line > file > built-in default**, so you can debug in production
 without editing a file. An **unknown field is an error**, not silence: an `apiban_kei`
@@ -491,6 +496,7 @@ tfps_ctl sources [--peer --country]   learned sources and the countries they cal
 tfps_ctl source <peer>                everything known about one source
 tfps_ctl peers                        sources by country breadth, when last heard
 tfps_ctl log [--limit N] [--ip IP]    the block audit log, newest first
+tfps_ctl serve                        the optional JSON API and /metrics — see "JSON API"
 
   --config PATH                       configuration, read for ignoreip (default /etc/tfps/config.json)
 ```
@@ -518,6 +524,96 @@ written directly, so an unban applies immediately. Learned state lives in SQLite
 written at checkpoint, so `status` reports **how old that snapshot is** rather than passing
 stale rows off as current. Reading blocks needs `CAP_BPF` (run as root); reading learned
 state needs only the database file.
+
+---
+
+## JSON API
+
+An optional HTTP server for other systems — a control panel, a ticketing tool, Prometheus —
+that need to know **what is blocked and why**, and optionally to lift a block. It is
+`tfps_ctl serve`, a separate process from the daemon: it reads the same kernel map and
+database `tfps_ctl` reads, so the API can be stopped, restarted or upgraded without touching
+enforcement, and a bug in it cannot take the packet path down with it.
+
+**Off by default.** Turn it on in `/etc/tfps/config.json`:
+
+```json
+"http": {
+  "enabled": true,
+  "listen": "127.0.0.1:9060",
+  "allow_unban": false
+}
+```
+
+then start the unit the installer put in place but did not enable:
+
+```sh
+systemctl enable --now tfps-api
+curl -s 127.0.0.1:9060/v1/blocks
+```
+
+`tfps_ctl serve --listen ADDR --allow-unban` override the file (command line beats file).
+Neither flag turns the API on by itself: `enabled` is the one switch.
+
+| method | path | answers |
+|---|---|---|
+| GET | `/v1/health` | `{"ok":true,"version":"…"}` |
+| GET | `/v1/status` | the `status --json` document |
+| GET | `/v1/stats` | the `stats --json` document |
+| GET | `/v1/blocks` | every blocked source with its reason and expiry: `banned --why --json` as one array |
+| GET | `/v1/blocks/{ip}` | one of those, or 404 |
+| GET | `/v1/log?limit=N&ip=IP` | the block audit log, newest first (`limit` 1–1000, default 50) |
+| POST | `/v1/unban` | body `{"ips":["…"],"source":"…","reason":"…"}`; only with `allow_unban` |
+| GET | `/metrics` | Prometheus text format |
+
+Every document is exactly what the matching `tfps_ctl … --json` prints, and keeps its
+null-not-zero rule: an unreadable database is `null`, never `0`. Errors are
+`{"error":"…"}` with 400 (bad input), 403 (unban off, or a request from a web page), 404,
+405, 411, 413 (body over 64 KiB), 415 (not `application/json`), or 503 (the block map or
+database cannot be read). `/v1/unban` answers with one `unban --json` document per address:
+**200** when every address was lifted, **422** when any was not blocked, **500** with
+`{"error":…,"results":[…]}` if the kernel failed part-way. At most 256 addresses per
+request; `source` defaults to `http`, and every unban lands in the same
+`manual_actions-YYYYMM.jsonl` record as one from the command line.
+
+`/metrics` exports the kernel counters (`tfps_xdp_seen_total`, `tfps_xdp_dropped_total`,
+`tfps_xdp_expired_total`), the blocks now (`tfps_blocked_sources{kind="manual|audit|apiban|unattributed"}`,
+`tfps_blocked_sources_permanent`), the retained audit log by reason
+(`tfps_block_log_entries`, a gauge, since the log is pruned), the daemon's traffic counters
+as of its last checkpoint (`tfps_traffic_total{counter=…}`) with
+`tfps_checkpoint_timestamp_seconds` so staleness is visible, the learned totals and
+`tfps_build_info`. A value that cannot be read is left out, never reported as 0.
+
+### Security model — read this before exposing it
+
+- **No authentication, no TLS.** Anyone who can reach the listen address can read every
+  block, and lift them when `allow_unban` is on. On the default loopback address that
+  means **every local user and process on the host**.
+- **Loopback by default.** Listening on any other address works, and logs a `WARNING` at
+  startup: the reverse proxy may well be on another host.
+- **Unbanning is a second switch, off by default.** Without `allow_unban`, `/v1/unban`
+  answers 403 before anything touches the block map. There is no ban over HTTP.
+- **Web pages are refused.** Any request with an `Origin` header gets 403, and the unban
+  route takes only `POST` with `Content-Type: application/json`, so a page open in a local
+  browser cannot lift a block. The `Host` header is not checked, so a DNS-rebinding page
+  *can* read the GET endpoints — the same reach every local process already has.
+- **Bounded.** Four worker threads, a short queue (a full one answers 503), 5-second read
+  and write timeouts, an 8 KiB request head, a 64 KiB body, one request per connection.
+- **Reduced privileges.** `tfps-api.service` keeps only `CAP_BPF` and `CAP_SYS_ADMIN`
+  (opening the map), not the daemon's capture and attach capabilities.
+
+For anything beyond the host, put a reverse proxy with authentication and TLS in front of
+it. For example, nginx with basic auth:
+
+```nginx
+location /tfps/ {
+    auth_basic           "tfps";
+    auth_basic_user_file /etc/nginx/tfps.htpasswd;
+    proxy_pass           http://127.0.0.1:9060/;
+}
+```
+
+Block, unblock and expiry webhooks are planned (issue #1), and will come from the same process.
 
 ---
 
@@ -583,6 +679,7 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 | **a broad international profile** | anomaly saturates by construction — a peer already calling 200 countries has no burst left |
 | **the first 30 days** | the behavioural layer's learning window, by design and announced |
 | **a low-and-slow mimic** | the residual gap no on-wire method closes — hence opt-in, TTL'd, unbannable |
+| **authentication or TLS on the JSON API** | it listens on loopback; anything wider is a reverse proxy's job — see "JSON API" |
 | **forged SIP `603`** | source-level XDP blocking is available with `--enforce-behavioural`; the SIP-level reject is still missing |
 
 ---

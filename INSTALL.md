@@ -82,6 +82,11 @@ Remove the drop-in to enforce.
 Configuration lives in `/etc/tfps/config.json`; every field is optional and the README's
 "Configuration" section describes each one. Restart after editing: `systemctl restart tfps`.
 
+The **optional JSON API** (blocks and their reasons over HTTP, plus Prometheus metrics) is
+installed as `tfps-api.service` but not enabled. Set `"http": {"enabled": true}` in the
+configuration, then `systemctl enable --now tfps-api`; it listens on `127.0.0.1:9060`. Read
+the README's "JSON API" section, its security model in particular, before exposing it.
+
 ## Pinning a version
 
 ```sh
@@ -129,7 +134,7 @@ temp directory and removes it afterwards.
 
 ## Upgrading
 
-Run the one line again. Binaries, XDP object and unit are replaced; the configuration and
+Run the one line again. Binaries, XDP object and units are replaced (a running `tfps-api` is restarted too); the configuration and
 the database in `/var/lib/tfps` are kept. The service is restarted, so the new binary is the
 one running, and the learned state and audit log survive the restart. Learned state is only
 discarded on an incompatible schema change, which the daemon announces at startup; the audit
@@ -138,8 +143,9 @@ log survives even that.
 ## Uninstalling
 
 ```sh
-systemctl disable --now tfps
-rm -f /etc/systemd/system/tfps.service /usr/local/bin/tfps /usr/local/bin/tfps_ctl
+systemctl disable --now tfps tfps-api
+rm -f /etc/systemd/system/tfps.service /etc/systemd/system/tfps-api.service
+rm -f /usr/local/bin/tfps /usr/local/bin/tfps_ctl
 rm -rf /usr/local/lib/tfps
 systemctl daemon-reload
 ```

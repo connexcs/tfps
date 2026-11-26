@@ -6,7 +6,7 @@
 #   tfps-x86_64-linux-musl/
 #     tfps  tfps_ctl
 #     ebpf/tfps_xdp.c                      compiled on the target against its own BTF
-#     packaging/tfps.service  config.example.json  install.sh
+#     packaging/tfps.service  tfps-api.service  config.example.json  install.sh
 #
 # Cut a release with:   git tag v0.3.1 && git push origin v0.3.1
 name: release
@@ -47,7 +47,8 @@ jobs:
           cp target/x86_64-unknown-linux-musl/release/tfps \
              target/x86_64-unknown-linux-musl/release/tfps_ctl "$out/"
           cp ebpf/tfps_xdp.c "$out/ebpf/"
-          cp packaging/tfps.service packaging/config.example.json packaging/install.sh "$out/packaging/"
+          cp packaging/tfps.service packaging/tfps-api.service packaging/config.example.json \
+             packaging/install.sh "$out/packaging/"
           tar czf "$out.tar.gz" "$out"
           sha256sum "$out.tar.gz" > "$out.tar.gz.sha256"
           ls -l "$out.tar.gz" && cat "$out.tar.gz.sha256"

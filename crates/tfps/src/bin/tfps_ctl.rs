@@ -57,6 +57,11 @@ SOURCE FILTERS:
   --country ISO                sources that have called this country, e.g. --country GB
   --limit N                    stop after N rows (default 50)
 
+HTTP API (off unless the configuration's \"http\" section enables it):
+  serve                        run the JSON API and /metrics in the foreground
+  --listen ADDR                IPv4 address:port (default: 127.0.0.1:9060)
+  --allow-unban                accept POST /v1/unban (default: off)
+
 GLOBAL:
   --db PATH                    database (default: {db})
   --map PATH                   an explicitly pinned block map
@@ -90,6 +95,10 @@ struct Args {
     source: Option<String>,
     /// Why, in the asker's words (`--reason`).
     reason: Option<String>,
+    /// `serve --listen`: overrides `http.listen`.
+    listen: Option<std::net::SocketAddrV4>,
+    /// `serve --allow-unban`: turns on `http.allow_unban`.
+    allow_unban: bool,
 }
 
 impl Args {
@@ -122,6 +131,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         config: PathBuf::from(tfps::config::DEFAULT_PATH),
         source: None,
         reason: None,
+        listen: None,
+        allow_unban: false,
     };
     let mut it = argv.iter();
     let value = |name: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -161,6 +172,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 tfps::manual_log::check_reason(&v)?;
                 a.reason = Some(v);
             }
+            "--listen" => {
+                a.listen = Some(
+                    value("--listen", &mut it)?
+                        .parse()
+                        .map_err(|e| format!("invalid --listen (IPv4 address:port): {e}"))?,
+                )
+            }
+            "--allow-unban" => a.allow_unban = true,
             "-h" | "--help" => return Err(String::new()),
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other if a.command.is_empty() => a.command = other.to_string(),
@@ -175,6 +194,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     if (a.source.is_some() || a.reason.is_some()) && !matches!(a.command.as_str(), "ban" | "unban")
     {
         return Err("--source and --reason apply to ban and unban only".into());
+    }
+    if (a.listen.is_some() || a.allow_unban) && a.command != "serve" {
+        return Err("--listen and --allow-unban apply to serve only".into());
+    }
+    if a.json && a.command == "serve" {
+        return Err("serve answers in JSON over HTTP; --json does not apply".into());
     }
     Ok(a)
 }
@@ -205,6 +230,7 @@ fn main() -> ExitCode {
         "countries" => countries(&args),
         "log" => log(&args),
         "forget" => forget(&args),
+        "serve" => serve(&args),
         other => Err(format!("unknown command: {other}")),
     };
     match r {
@@ -1192,6 +1218,60 @@ fn forget(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// `serve`: the JSON API, in the foreground, until the process is stopped.
+///
+/// Off unless the configuration enables it, and then it says so and exits 0, so
+/// the unit can be installed and left alone without systemd restarting it.
+fn serve(args: &Args) -> Result<(), String> {
+    let http = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => c.http.unwrap_or_default(),
+        tfps::config::Loaded::Absent => tfps::config::HttpConfig::default(),
+        // A broken file must not quietly turn into "the API is off".
+        tfps::config::Loaded::Broken(e) => return Err(e),
+    };
+    let Some((listen, opts)) = serve_settings(&http, args.listen, args.allow_unban) else {
+        say!(
+            "the HTTP API is off: set \"http\": {{\"enabled\": true}} in {} to serve it",
+            args.config.display()
+        );
+        return Ok(());
+    };
+    let listener =
+        std::net::TcpListener::bind(listen).map_err(|e| format!("listening on {listen}: {e}"))?;
+    if let Some(w) = tfps::api::bind_warning(listen, opts.allow_unban) {
+        eprintln!("{w}");
+    }
+    eprintln!(
+        "tfps_ctl serve: listening on http://{listen}/ (unban over HTTP: {})",
+        if opts.allow_unban { "on" } else { "off" }
+    );
+    tfps::api::serve(
+        listener,
+        std::sync::Arc::new(tfps::api::CtlBackend(args.ctx())),
+        opts,
+    )
+    .map_err(|e| format!("serving: {e}"))
+}
+
+/// The listen address and options `serve` runs with, or `None` when the API is
+/// off. The command line beats the file, which beats the default; neither flag
+/// turns the API on by itself, so `enabled` stays the one switch.
+fn serve_settings(
+    http: &tfps::config::HttpConfig,
+    listen: Option<std::net::SocketAddrV4>,
+    allow_unban: bool,
+) -> Option<(std::net::SocketAddrV4, tfps::api::Options)> {
+    if !http.enabled {
+        return None;
+    }
+    Some((
+        listen.unwrap_or(http.listen),
+        tfps::api::Options {
+            allow_unban: allow_unban || http.allow_unban,
+        },
+    ))
+}
+
 // ---------------------------------------------------------------- helpers
 
 /// A compact duration. Operators read these in a column, so the widest case has to stay
@@ -1859,6 +1939,58 @@ mod tests {
              plain path; {calls} call(s) found, so one mode is silently losing the \
              specific kernel-failure reason again"
         );
+    }
+
+    #[test]
+    fn serve_flags_parse_and_belong_to_serve_only() {
+        let a = args(&["serve", "--listen", "0.0.0.0:8080", "--allow-unban"]).expect("parses");
+        assert_eq!(
+            a.listen.map(|l| l.to_string()).as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        assert!(a.allow_unban);
+        assert!(args(&["status", "--allow-unban"]).is_err());
+        assert!(args(&["status", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(
+            args(&["serve", "--listen", "[::1]:9060"]).is_err(),
+            "IPv4 only"
+        );
+        assert!(args(&["serve", "--json"]).is_err());
+    }
+
+    #[test]
+    fn serve_runs_only_when_enabled_and_the_command_line_wins() {
+        let mut http = tfps::config::HttpConfig::default();
+        assert_eq!(
+            serve_settings(&http, None, true),
+            None,
+            "a flag does not turn it on"
+        );
+        http.enabled = true;
+        let (listen, opts) = serve_settings(&http, None, false).expect("on");
+        assert_eq!(listen.to_string(), "127.0.0.1:9060");
+        assert!(
+            !opts.allow_unban,
+            "unban is a second switch, off by default"
+        );
+        let other = "0.0.0.0:8080".parse().unwrap();
+        let (listen, opts) = serve_settings(&http, Some(other), true).expect("on");
+        assert_eq!((listen, opts.allow_unban), (other, true));
+        http.allow_unban = true;
+        assert!(
+            serve_settings(&http, None, false)
+                .expect("on")
+                .1
+                .allow_unban
+        );
+    }
+
+    #[test]
+    fn the_help_text_advertises_serve() {
+        let u = usage();
+        for w in ["serve", "--listen", "--allow-unban"] {
+            assert!(u.contains(w), "{w}");
+        }
     }
 
     #[test]

@@ -179,6 +179,12 @@ pub fn log_docs(ctx: &Ctx, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>
         .collect())
 }
 
+/// `block_log` rows by reason, over everything the log still retains (the
+/// daemon prunes it on the audit window). For `/metrics`.
+pub fn block_log_counts(ctx: &Ctx) -> Result<Vec<(String, u32)>, String> {
+    Store::open_readonly(&ctx.db)?.blocks_by_reason(0)
+}
+
 /// Which blocks `unban_docs` lifts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnbanTarget<'a> {

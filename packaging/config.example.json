@@ -7,5 +7,10 @@
   "no_enforce_one_way": false,
   "learn_days": 30,
   "block_ttl": 3600,
-  "stats_every": 60
+  "stats_every": 60,
+  "http": {
+    "enabled": false,
+    "listen": "127.0.0.1:9060",
+    "allow_unban": false
+  }
 }
