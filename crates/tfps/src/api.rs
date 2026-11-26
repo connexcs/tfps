@@ -49,6 +49,11 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// Header lines in one request.
 pub const MAX_HEADERS: usize = 32;
+/// Full `/v1/blocks` listings in progress at once. A listing of a full map costs
+/// tens of megabytes while it is built and written, so they take turns rather
+/// than multiply under the service's memory limit; a request that cannot get a
+/// turn before its deadline gets 503.
+pub const MAX_LISTINGS: usize = 1;
 /// The request line and headers together.
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// A request body.
@@ -197,6 +202,10 @@ pub struct Response {
     pub allow: Option<&'static str>,
     /// `WWW-Authenticate: Bearer`, on a 401.
     pub challenge: bool,
+    /// A listing written to the socket one document at a time, instead of
+    /// `body`: a full block map would otherwise sit in memory a second time as
+    /// one JSON string. Sent without `Content-Length`, ended by closing.
+    pub docs: Option<Vec<BannedDoc>>,
 }
 
 const JSON: &str = "application/json";
@@ -210,6 +219,24 @@ impl Response {
             body,
             allow: None,
             challenge: false,
+            docs: None,
+        }
+    }
+
+    /// A JSON array streamed from `docs`, byte for byte what `json(200,
+    /// to_json(&docs))` would send.
+    fn listing(docs: Vec<BannedDoc>) -> Self {
+        Response {
+            docs: Some(docs),
+            ..Self::json(200, String::new())
+        }
+    }
+
+    /// The body as it goes on the wire, for tests and the busy reply.
+    pub fn body_text(&self) -> String {
+        match &self.docs {
+            Some(docs) => to_json(docs),
+            None => self.body.clone(),
         }
     }
 
@@ -239,20 +266,22 @@ impl Response {
     /// The bytes on the wire.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = self.head();
-        out.extend_from_slice(self.body.as_bytes());
+        out.extend_from_slice(self.body_text().as_bytes());
         out
     }
 
     /// The status line and headers, ending with the blank line.
     fn head(&self) -> Vec<u8> {
         let mut head = format!(
-            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n\
              Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
             self.status,
             reason_phrase(self.status),
             self.content_type,
-            self.body.len()
         );
+        if self.docs.is_none() {
+            head.push_str(&format!("Content-Length: {}\r\n", self.body.len()));
+        }
         if let Some(a) = self.allow {
             head.push_str(&format!("Allow: {a}\r\n"));
         }
@@ -471,14 +500,44 @@ fn io_error_response(e: &std::io::Error) -> Response {
 }
 
 /// Writes `resp` by `deadline`, a slice at a time, each bounded by the time left.
-/// A reader too slow to take it in time is abandoned rather than waited on.
+/// A reader too slow to take it in time is abandoned rather than waited on. A
+/// listing is serialised a document at a time into a small buffer, never whole.
 fn write_response<C: Conn>(c: &mut C, resp: &Response, deadline: Instant) {
-    for part in [resp.head().as_slice(), resp.body.as_bytes()] {
-        for piece in part.chunks(16 * 1024) {
-            let Some(left) = remaining(deadline) else {
+    const SLICE: usize = 16 * 1024;
+    let mut send = |bytes: &[u8]| -> bool {
+        bytes.chunks(SLICE).all(|piece| {
+            remaining(deadline)
+                .is_some_and(|left| c.limit(left).is_ok() && c.write_all(piece).is_ok())
+        })
+    };
+    if !send(&resp.head()) {
+        return;
+    }
+    match &resp.docs {
+        None => {
+            if !send(resp.body.as_bytes()) {
                 return;
-            };
-            if c.limit(left).is_err() || c.write_all(piece).is_err() {
+            }
+        }
+        Some(docs) => {
+            let mut buf = Vec::with_capacity(2 * SLICE);
+            buf.push(b'[');
+            for (i, doc) in docs.iter().enumerate() {
+                if i > 0 {
+                    buf.push(b',');
+                }
+                if serde_json::to_writer(&mut buf, doc).is_err() {
+                    return;
+                }
+                if buf.len() >= SLICE {
+                    if !send(&buf) {
+                        return;
+                    }
+                    buf.clear();
+                }
+            }
+            buf.push(b']');
+            if !send(&buf) {
                 return;
             }
         }
@@ -486,13 +545,72 @@ fn write_response<C: Conn>(c: &mut C, resp: &Response, deadline: Instant) {
     let _ = c.flush();
 }
 
+/// A counting gate: at most `max` holders at once, waiting no later than a deadline.
+struct Gate {
+    held: std::sync::Mutex<usize>,
+    freed: std::sync::Condvar,
+    max: usize,
+}
+
+/// One turn through a [`Gate`], given back when dropped.
+struct Turn<'a>(&'a Gate);
+
+impl Gate {
+    const fn new(max: usize) -> Self {
+        Gate {
+            held: std::sync::Mutex::new(0),
+            freed: std::sync::Condvar::new(),
+            max,
+        }
+    }
+
+    fn enter(&self, deadline: Instant) -> Option<Turn<'_>> {
+        let mut held = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        while *held >= self.max {
+            let left = remaining(deadline)?;
+            held = self
+                .freed
+                .wait_timeout(held, left)
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        *held += 1;
+        Some(Turn(self))
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut held = self.0.held.lock().unwrap_or_else(|p| p.into_inner());
+        *held -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+/// Full listings in progress; see [`MAX_LISTINGS`].
+static LISTINGS: Gate = Gate::new(MAX_LISTINGS);
+
 /// Reads, routes and answers one connection, then lets it close. Reading the
 /// request and writing the response each get `opts.deadline`.
 pub fn handle_connection<C: Conn>(mut c: C, backend: &dyn Backend, opts: &Options) {
-    let response = match read_request(&mut c, Instant::now() + opts.deadline) {
-        Ok(req) => route(&req, backend, opts),
-        Err(resp) => resp,
+    let deadline = Instant::now() + opts.deadline;
+    let req = match read_request(&mut c, deadline) {
+        Ok(req) => req,
+        Err(resp) => return write_response(&mut c, &resp, Instant::now() + opts.deadline),
     };
+    // A full listing holds its turn while it is built and while it is written.
+    let _turn = if req.path == "/v1/blocks" && req.method == "GET" {
+        match LISTINGS.enter(deadline) {
+            Some(turn) => Some(turn),
+            None => {
+                let busy = Response::error(503, "another block listing is in progress; try again");
+                return write_response(&mut c, &busy, Instant::now() + opts.deadline);
+            }
+        }
+    } else {
+        None
+    };
+    let response = route(&req, backend, opts);
     write_response(&mut c, &response, Instant::now() + opts.deadline);
 }
 
@@ -554,7 +672,7 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
             Err(e) => Response::error(503, &e),
         }),
         "/v1/blocks" => get_only(&|| match backend.banned() {
-            Ok(docs) => Response::json(200, to_json(&docs)),
+            Ok(docs) => Response::listing(docs),
             Err(e) => Response::error(503, &e),
         }),
         "/v1/log" => get_only(&|| log(req, backend)),
@@ -571,6 +689,7 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
             body: metrics(backend),
             allow: None,
             challenge: false,
+            docs: None,
         }),
         p => match p.strip_prefix("/v1/blocks/") {
             Some(ip) => get_only(&|| one_block(ip, backend)),
@@ -1247,7 +1366,7 @@ mod tests {
 
     fn json(r: &Response) -> serde_json::Value {
         assert_eq!(r.content_type, JSON, "{r:?}");
-        serde_json::from_str(&r.body).expect("valid JSON")
+        serde_json::from_str(&r.body_text()).expect("valid JSON")
     }
 
     // ── reading requests off the wire ──────────────────────────────────────
@@ -1550,10 +1669,43 @@ mod tests {
             .iter()
             .map(|d| crate::json_line(d).unwrap())
             .collect();
-        assert_eq!(r.body, format!("[{}]", lines.join(",")));
+        assert_eq!(r.body_text(), format!("[{}]", lines.join(",")));
         let v = json(&r);
         assert_eq!(v[0]["reason"], "scanner", "every block carries its reason");
         assert_eq!(v[1]["source"], "panel");
+    }
+
+    /// What goes on the wire for a streamed listing: the same bytes the
+    /// buffered body would have been, with no Content-Length and the end of the
+    /// body marked by closing.
+    #[test]
+    fn a_streamed_listing_sends_the_same_bytes_as_a_buffered_one() {
+        let mut c = TestConn::new("GET /v1/blocks HTTP/1.1\r\nHost: x\r\n\r\n");
+        handle_connection(&mut c, &up(), &off());
+        let text = c.written();
+        let (head, body) = text.split_once("\r\n\r\n").expect("head and body");
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
+        assert!(!head.contains("Content-Length"), "{head}");
+        assert!(head.contains("Connection: close"), "{head}");
+        assert_eq!(body, to_json(&up().docs()));
+    }
+
+    #[test]
+    fn the_listing_gate_takes_turns_and_gives_up_at_the_deadline() {
+        let gate = Gate::new(1);
+        let first = gate
+            .enter(Instant::now() + Duration::from_secs(1))
+            .expect("free");
+        let start = Instant::now();
+        assert!(
+            gate.enter(start + Duration::from_millis(100)).is_none(),
+            "no second turn while the first is held"
+        );
+        assert!(start.elapsed() >= Duration::from_millis(100), "it waited");
+        drop(first);
+        assert!(gate
+            .enter(Instant::now() + Duration::from_millis(100))
+            .is_some());
     }
 
     #[test]

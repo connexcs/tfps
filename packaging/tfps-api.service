@@ -37,6 +37,12 @@ ProtectSystem=full
 ReadOnlyPaths=/etc/tfps
 ProtectHome=yes
 PrivateTmp=yes
+# Measured with a simulated full block map (65,536 entries, `cargo run --release
+# -p tfps --example api_memory`): about 41 MB peak, with /v1/blocks listings taking
+# turns (one at a time) and streamed. One glibc malloc arena keeps it there; with
+# the default one per thread, four workers each keep a listing's worth (~160 MB).
+# The musl release build has no per-thread arenas and ignores this.
+Environment=MALLOC_ARENA_MAX=1
 MemoryMax=64M
 
 StandardOutput=journal

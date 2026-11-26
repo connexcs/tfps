@@ -729,7 +729,7 @@ pub fn traffic_doc(line: Option<&str>, ts: Option<u32>, now: u32) -> Option<Traf
 /// `first_seen` is the time of the oldest audit row for the address the log
 /// still holds, and `reason`/`detail` come from its newest row
 /// (`Store::block_summaries`, asked only about the addresses in the block map).
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BannedDoc {
     pub ip: String,
     pub reason: Option<String>,
