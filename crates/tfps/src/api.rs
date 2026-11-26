@@ -24,11 +24,11 @@
 //! socket, a kernel map, or a database.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,8 +41,14 @@ pub const WORKERS: usize = 4;
 /// Accepted connections waiting for a worker. Past this, a new connection gets a
 /// 503 straight away rather than an unbounded wait.
 pub const QUEUE: usize = 16;
-/// How long a read or a write on one connection may stall.
+/// How long a single read or write on one connection may stall.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long reading a whole request may take, and separately how long writing
+/// its response may take: a deadline, not an inactivity timeout, so a client
+/// trickling a byte at a time cannot hold a worker for longer than this.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+/// Header lines in one request.
+pub const MAX_HEADERS: usize = 32;
 /// The request line and headers together.
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// A request body.
@@ -122,9 +128,41 @@ impl Backend for CtlBackend {
 }
 
 /// What the operator switched on. The listen address lives with the listener.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
+    /// Accept `POST /v1/unban`.
     pub allow_unban: bool,
+    /// The `Host` values a request may carry, compared without regard to case.
+    /// A request naming any other host is refused: that is what stops a web page
+    /// that rebinds its own name to this address from reading the API.
+    pub hosts: Vec<String>,
+    /// When set, every route but `/v1/health` needs `Authorization: Bearer <token>`.
+    pub token: Option<String>,
+    /// [`REQUEST_DEADLINE`], shortened by tests.
+    pub deadline: Duration,
+}
+
+impl Options {
+    pub fn new(allow_unban: bool, hosts: Vec<String>, token: Option<String>) -> Self {
+        Options {
+            allow_unban,
+            hosts,
+            token,
+            deadline: REQUEST_DEADLINE,
+        }
+    }
+}
+
+/// The `Host` values `serve` accepts by default: the listen address as clients
+/// write it, plus `localhost` with the same port when listening on loopback,
+/// plus the operator's own `extra` (for a reverse proxy's public name).
+pub fn allowed_hosts(listen: SocketAddrV4, extra: &[String]) -> Vec<String> {
+    let mut hosts = vec![listen.to_string()];
+    if listen.ip().is_loopback() {
+        hosts.push(format!("localhost:{}", listen.port()));
+    }
+    hosts.extend(extra.iter().map(|h| h.trim().to_ascii_lowercase()));
+    hosts
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -157,6 +195,8 @@ pub struct Response {
     pub body: String,
     /// `Allow`, on a 405.
     pub allow: Option<&'static str>,
+    /// `WWW-Authenticate: Bearer`, on a 401.
+    pub challenge: bool,
 }
 
 const JSON: &str = "application/json";
@@ -169,6 +209,7 @@ impl Response {
             content_type: JSON,
             body,
             allow: None,
+            challenge: false,
         }
     }
 
@@ -188,8 +229,22 @@ impl Response {
         }
     }
 
+    fn unauthorized() -> Self {
+        Response {
+            challenge: true,
+            ..Self::error(401, "this API needs Authorization: Bearer <token>")
+        }
+    }
+
     /// The bytes on the wire.
     pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = self.head();
+        out.extend_from_slice(self.body.as_bytes());
+        out
+    }
+
+    /// The status line and headers, ending with the blank line.
+    fn head(&self) -> Vec<u8> {
         let mut head = format!(
             "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
              Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n",
@@ -201,10 +256,11 @@ impl Response {
         if let Some(a) = self.allow {
             head.push_str(&format!("Allow: {a}\r\n"));
         }
+        if self.challenge {
+            head.push_str("WWW-Authenticate: Bearer\r\n");
+        }
         head.push_str("\r\n");
-        let mut out = head.into_bytes();
-        out.extend_from_slice(self.body.as_bytes());
-        out
+        head.into_bytes()
     }
 }
 
@@ -213,6 +269,7 @@ fn reason_phrase(status: u16) -> &'static str {
         100 => "Continue",
         200 => "OK",
         400 => "Bad Request",
+        401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -237,65 +294,113 @@ fn to_json<T: Serialize + ?Sized>(v: &T) -> String {
         .unwrap_or_else(|e| format!("{{\"error\":\"serialising the response: {e}\"}}"))
 }
 
-/// Reads one request, refusing anything past the limits before it is buffered.
+/// One connection, as the server reads and writes it.
+pub trait Conn: Read + Write {
+    /// Bounds the next read or write to `remaining` (never above [`IO_TIMEOUT`]).
+    fn limit(&mut self, remaining: Duration) -> std::io::Result<()>;
+}
+
+impl Conn for TcpStream {
+    fn limit(&mut self, remaining: Duration) -> std::io::Result<()> {
+        let t = remaining.clamp(Duration::from_millis(1), IO_TIMEOUT);
+        self.set_read_timeout(Some(t))?;
+        self.set_write_timeout(Some(t))
+    }
+}
+
+impl<C: Conn + ?Sized> Conn for &mut C {
+    fn limit(&mut self, remaining: Duration) -> std::io::Result<()> {
+        (**self).limit(remaining)
+    }
+}
+
+/// Time left before `deadline`, or `None` when it has passed.
+fn remaining(deadline: Instant) -> Option<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+}
+
+/// Whether `head` has a line ending other than CRLF: a bare LF, or a CR not
+/// followed by LF. HTTP/1.1 parsers disagree on what to do with those, and that
+/// disagreement between a proxy and this server is how requests get smuggled,
+/// so they are refused rather than interpreted.
+fn bad_line_ending(head: &[u8]) -> bool {
+    head.iter().enumerate().any(|(i, &b)| match b {
+        b'\n' => i == 0 || head[i - 1] != b'\r',
+        b'\r' => head.get(i + 1).is_some_and(|&n| n != b'\n'),
+        _ => false,
+    })
+}
+
+/// Reads one request through `httparse`, refusing anything past the limits
+/// before it is buffered, and anything not read in full by `deadline`.
 ///
-/// `before_body` is called once the headers are accepted and a body is coming, so
-/// the caller can send `100 Continue` to a client that asked for it.
-pub fn read_request<R: BufRead>(
-    r: &mut R,
-    mut before_body: impl FnMut(),
-) -> Result<Request, Response> {
-    let mut used = 0usize;
-    let mut line = |r: &mut R| -> Result<String, Response> {
-        let mut buf = Vec::new();
-        let room = (MAX_HEADER_BYTES - used) as u64;
-        let n = r
-            .by_ref()
-            .take(room)
-            .read_until(b'\n', &mut buf)
-            .map_err(|e| io_error_response(&e))?;
-        used += n;
-        if n == 0 {
-            return Err(Response::error(400, "the request ended early"));
+/// On top of what `httparse` checks (the request line, header names against the
+/// token grammar), this refuses: line endings other than CRLF; any
+/// `Transfer-Encoding`; a `Content-Length` or `Host` given more than once; a
+/// `Content-Length` that is not plain digits. A client that asks for
+/// `100-continue` is told to go ahead once its headers are accepted.
+pub fn read_request<C: Conn>(c: &mut C, deadline: Instant) -> Result<Request, Response> {
+    let mut buf: Vec<u8> = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    let mut read_some = |c: &mut C, buf: &mut Vec<u8>| -> Result<(), Response> {
+        let left =
+            remaining(deadline).ok_or_else(|| Response::error(408, "the request took too long"))?;
+        c.limit(left).map_err(|e| io_error_response(&e))?;
+        match c.read(&mut chunk) {
+            Ok(0) => Err(Response::error(400, "the request ended early")),
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                Ok(())
+            }
+            Err(e) => Err(io_error_response(&e)),
         }
-        if buf.last() != Some(&b'\n') {
+    };
+
+    let head_end = loop {
+        let end = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4);
+        let head = &buf[..end.unwrap_or(buf.len())];
+        if bad_line_ending(head) {
+            return Err(Response::error(400, "lines must end with CRLF"));
+        }
+        if end.unwrap_or(buf.len()) > MAX_HEADER_BYTES {
             return Err(Response::error(
                 431,
                 &format!("the request line and headers must fit in {MAX_HEADER_BYTES} bytes"),
             ));
         }
-        String::from_utf8(buf)
-            .map(|s| s.trim_end_matches(['\r', '\n']).to_string())
-            .map_err(|_| Response::error(400, "the request head is not UTF-8"))
+        if let Some(end) = end {
+            break end;
+        }
+        read_some(c, &mut buf)?;
     };
 
-    let request_line = line(r)?;
-    let mut parts = request_line.split(' ');
-    let (method, target, version) = match (parts.next(), parts.next(), parts.next(), parts.next()) {
-        (Some(m), Some(t), Some(v), None) if !m.is_empty() && t.starts_with('/') => (m, t, v),
-        _ => return Err(Response::error(400, "malformed request line")),
+    let mut slots = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut parsed = httparse::Request::new(&mut slots);
+    match parsed.parse(&buf[..head_end]) {
+        Ok(httparse::Status::Complete(_)) => {}
+        Ok(httparse::Status::Partial) => return Err(Response::error(400, "incomplete request")),
+        Err(httparse::Error::TooManyHeaders) => {
+            return Err(Response::error(
+                431,
+                &format!("at most {MAX_HEADERS} header lines"),
+            ))
+        }
+        Err(e) => return Err(Response::error(400, &format!("malformed request: {e}"))),
+    }
+    let (Some(method), Some(target), Some(_)) = (parsed.method, parsed.path, parsed.version) else {
+        return Err(Response::error(400, "malformed request line"));
     };
-    if version != "HTTP/1.1" && version != "HTTP/1.0" {
-        return Err(Response::error(
-            400,
-            "only HTTP/1.0 and HTTP/1.1 are spoken here",
-        ));
+    if !target.starts_with('/') {
+        return Err(Response::error(400, "the request target must be a path"));
     }
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
-
-    let mut headers = Vec::new();
-    loop {
-        let l = line(r)?;
-        if l.is_empty() {
-            break;
-        }
-        let (name, value) = l
-            .split_once(':')
-            .ok_or_else(|| Response::error(400, "malformed header line"))?;
-        if name.is_empty() || name.contains(char::is_whitespace) {
-            return Err(Response::error(400, "malformed header name"));
-        }
-        headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+    let mut headers = Vec::with_capacity(parsed.headers.len());
+    for h in parsed.headers.iter() {
+        let value = std::str::from_utf8(h.value)
+            .map_err(|_| Response::error(400, "a header value is not UTF-8"))?;
+        headers.push((h.name.to_ascii_lowercase(), value.trim().to_string()));
     }
     let mut req = Request {
         method: method.to_string(),
@@ -305,17 +410,25 @@ pub fn read_request<R: BufRead>(
         body: Vec::new(),
     };
 
-    if req.header("transfer-encoding").is_some() {
+    let count = |name: &str| req.headers.iter().filter(|(n, _)| n == name).count();
+    if count("transfer-encoding") > 0 {
         return Err(Response::error(
             411,
-            "chunked bodies are not accepted; send Content-Length",
+            "Transfer-Encoding is not accepted; send Content-Length",
+        ));
+    }
+    if count("content-length") > 1 || count("host") > 1 {
+        return Err(Response::error(
+            400,
+            "Content-Length and Host may appear once each",
         ));
     }
     let length = match req.header("content-length") {
         None => 0,
-        Some(v) => v
+        Some(v) if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => v
             .parse::<usize>()
-            .map_err(|_| Response::error(400, "Content-Length is not a number"))?,
+            .map_err(|_| Response::error(413, "Content-Length is too large"))?,
+        Some(_) => return Err(Response::error(400, "Content-Length is not a number")),
     };
     if length > MAX_BODY_BYTES {
         return Err(Response::error(
@@ -327,15 +440,22 @@ pub fn read_request<R: BufRead>(
         return Err(Response::error(411, "a POST needs Content-Length"));
     }
     if length > 0 {
-        if req
+        let mut body = buf.split_off(head_end);
+        let continue_asked = req
             .header("expect")
-            .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"))
-        {
-            before_body();
+            .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
+        if continue_asked && body.is_empty() {
+            if let Some(left) = remaining(deadline) {
+                let _ = c.limit(left);
+                let _ = c.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+                let _ = c.flush();
+            }
         }
-        req.body = vec![0; length];
-        r.read_exact(&mut req.body)
-            .map_err(|e| io_error_response(&e))?;
+        while body.len() < length {
+            read_some(c, &mut body)?;
+        }
+        body.truncate(length);
+        req.body = body;
     }
     Ok(req)
 }
@@ -350,29 +470,43 @@ fn io_error_response(e: &std::io::Error) -> Response {
     }
 }
 
-/// Reads, routes and answers one connection, then lets it close.
-///
-/// `r` and `w` are the two halves of one connection (`TcpStream::try_clone`),
-/// so a `100 Continue` can be written while the request is still being read.
-pub fn handle_connection<R: Read, W: Write>(r: R, mut w: W, backend: &dyn Backend, opts: Options) {
-    let mut reader = BufReader::new(r);
-    let parsed = read_request(&mut reader, || {
-        let _ = w.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-        let _ = w.flush();
-    });
-    let response = match parsed {
+/// Writes `resp` by `deadline`, a slice at a time, each bounded by the time left.
+/// A reader too slow to take it in time is abandoned rather than waited on.
+fn write_response<C: Conn>(c: &mut C, resp: &Response, deadline: Instant) {
+    for part in [resp.head().as_slice(), resp.body.as_bytes()] {
+        for piece in part.chunks(16 * 1024) {
+            let Some(left) = remaining(deadline) else {
+                return;
+            };
+            if c.limit(left).is_err() || c.write_all(piece).is_err() {
+                return;
+            }
+        }
+    }
+    let _ = c.flush();
+}
+
+/// Reads, routes and answers one connection, then lets it close. Reading the
+/// request and writing the response each get `opts.deadline`.
+pub fn handle_connection<C: Conn>(mut c: C, backend: &dyn Backend, opts: &Options) {
+    let response = match read_request(&mut c, Instant::now() + opts.deadline) {
         Ok(req) => route(&req, backend, opts),
         Err(resp) => resp,
     };
-    let _ = w.write_all(&response.to_bytes());
-    let _ = w.flush();
+    write_response(&mut c, &response, Instant::now() + opts.deadline);
+}
+
+/// Equal secrets, compared in time that does not depend on where they differ.
+fn same_secret(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 // ---------------------------------------------------------------- routing
 
-/// Every rule the API applies, in order: refuse cross-origin requests, find the
-/// route, check its method and media type, then answer.
-pub fn route(req: &Request, backend: &dyn Backend, opts: Options) -> Response {
+/// Every rule the API applies, in order: refuse requests from web pages, refuse
+/// hosts it does not answer to, check the token, find the route, check its
+/// method and media type, then answer.
+pub fn route(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
     // A browser adds `Origin` to every cross-origin request and to every POST.
     // Nothing that legitimately uses this API is a web page, so refusing it is
     // free, and it stops a page in a local browser from lifting a block.
@@ -381,6 +515,29 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: Options) -> Response {
             403,
             "requests from a web page (with an Origin header) are refused",
         );
+    }
+    // A page that rebinds its own name to this address sends that name as Host;
+    // only the names this API is configured to answer to get through.
+    match req.header("host") {
+        Some(h) if opts.hosts.iter().any(|a| a.eq_ignore_ascii_case(h)) => {}
+        Some(h) => {
+            return Response::error(
+                403,
+                &format!("Host {h:?} is not one this API answers to; see http.hosts"),
+            )
+        }
+        None => return Response::error(403, "a Host header is required"),
+    }
+    if let Some(token) = &opts.token {
+        let given = req
+            .header("authorization")
+            .and_then(|a| a.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, t)| t.trim());
+        let ok = given.is_some_and(|t| same_secret(t.as_bytes(), token.as_bytes()));
+        if !ok && req.path != "/v1/health" {
+            return Response::unauthorized();
+        }
     }
     let get_only = |f: &dyn Fn() -> Response| {
         if req.method == "GET" {
@@ -413,6 +570,7 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: Options) -> Response {
             content_type: PROMETHEUS,
             body: metrics(backend),
             allow: None,
+            challenge: false,
         }),
         p => match p.strip_prefix("/v1/blocks/") {
             Some(ip) => get_only(&|| one_block(ip, backend)),
@@ -511,7 +669,7 @@ fn is_json(req: &Request) -> bool {
     })
 }
 
-fn unban(req: &Request, backend: &dyn Backend, opts: Options) -> Response {
+fn unban(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
     if !opts.allow_unban {
         return Response::error(
             403,
@@ -783,10 +941,12 @@ pub fn serve(
 ) -> std::io::Result<()> {
     let (tx, rx) = sync_channel::<TcpStream>(QUEUE);
     let rx = Arc::new(Mutex::new(rx));
+    let opts = Arc::new(opts);
     for _ in 0..WORKERS {
         let rx = Arc::clone(&rx);
         let backend = Arc::clone(&backend);
-        std::thread::spawn(move || worker(&rx, backend.as_ref(), opts));
+        let opts = Arc::clone(&opts);
+        std::thread::spawn(move || worker(&rx, backend.as_ref(), &opts));
     }
     for conn in listener.incoming() {
         let stream = match conn {
@@ -813,7 +973,7 @@ pub fn serve(
     Ok(())
 }
 
-fn worker(rx: &Mutex<Receiver<TcpStream>>, backend: &dyn Backend, opts: Options) {
+fn worker(rx: &Mutex<Receiver<TcpStream>>, backend: &dyn Backend, opts: &Options) {
     loop {
         // The lock is held only while waiting for the next connection, never
         // while handling one. A poisoned lock means another worker panicked
@@ -823,12 +983,7 @@ fn worker(rx: &Mutex<Receiver<TcpStream>>, backend: &dyn Backend, opts: Options)
             Err(poisoned) => poisoned.into_inner().recv(),
         };
         let Ok(stream) = next else { return };
-        let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        match stream.try_clone() {
-            Ok(w) => handle_connection(stream, w, backend, opts),
-            Err(e) => eprintln!("tfps_ctl serve: connection: {e}"),
-        }
+        handle_connection(stream, backend, opts);
     }
 }
 
@@ -837,7 +992,6 @@ mod tests {
     use super::*;
     use crate::ctl::{action_doc, banned_doc, log_doc};
     use crate::store::BlockRow;
-    use std::io::Cursor;
 
     /// A backend with fixed answers, so every route is testable without a
     /// kernel map or a database. `None` means "that source cannot be read".
@@ -994,12 +1148,19 @@ mod tests {
         }
     }
 
+    const HOST: &str = "127.0.0.1:9060";
+
+    fn host() -> (String, String) {
+        ("host".into(), HOST.into())
+    }
+
     fn get(path: &str) -> Request {
         let (path, query) = path.split_once('?').unwrap_or((path, ""));
         Request {
             method: "GET".into(),
             path: path.into(),
             query: query.into(),
+            headers: vec![host()],
             ..Request::default()
         }
     }
@@ -1008,14 +1169,81 @@ mod tests {
         Request {
             method: "POST".into(),
             path: "/v1/unban".into(),
-            headers: vec![("content-type".into(), "application/json".into())],
+            headers: vec![host(), ("content-type".into(), "application/json".into())],
             body: body.as_bytes().to_vec(),
             ..Request::default()
         }
     }
 
-    const ON: Options = Options { allow_unban: true };
-    const OFF: Options = Options { allow_unban: false };
+    fn opts(allow_unban: bool) -> Options {
+        Options {
+            deadline: Duration::from_secs(2),
+            ..Options::new(allow_unban, vec![HOST.into(), "x".into()], None)
+        }
+    }
+
+    fn on() -> Options {
+        opts(true)
+    }
+
+    fn off() -> Options {
+        opts(false)
+    }
+
+    /// A connection in memory: what the client sends arrives in the given
+    /// pieces, one per read, each after `delay`; what the server writes is kept.
+    #[derive(Default)]
+    struct TestConn {
+        pieces: std::collections::VecDeque<Vec<u8>>,
+        delay: Duration,
+        written: Vec<u8>,
+    }
+
+    impl TestConn {
+        fn new(raw: &str) -> Self {
+            Self::pieces(&[raw.as_bytes()])
+        }
+        fn pieces(pieces: &[&[u8]]) -> Self {
+            TestConn {
+                pieces: pieces.iter().map(|p| p.to_vec()).collect(),
+                ..TestConn::default()
+            }
+        }
+        fn written(&self) -> String {
+            String::from_utf8_lossy(&self.written).into_owned()
+        }
+    }
+
+    impl Read for TestConn {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let Some(mut piece) = self.pieces.pop_front() else {
+                return Ok(0);
+            };
+            let n = piece.len().min(buf.len());
+            buf[..n].copy_from_slice(&piece[..n]);
+            if n < piece.len() {
+                self.pieces.push_front(piece.split_off(n));
+            }
+            Ok(n)
+        }
+    }
+
+    impl Write for TestConn {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Conn for TestConn {
+        fn limit(&mut self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn json(r: &Response) -> serde_json::Value {
         assert_eq!(r.content_type, JSON, "{r:?}");
@@ -1025,7 +1253,10 @@ mod tests {
     // ── reading requests off the wire ──────────────────────────────────────
 
     fn parse(raw: &str) -> Result<Request, Response> {
-        read_request(&mut Cursor::new(raw.as_bytes().to_vec()), || {})
+        read_request(
+            &mut TestConn::new(raw),
+            Instant::now() + Duration::from_secs(5),
+        )
     }
 
     #[test]
@@ -1095,22 +1326,86 @@ mod tests {
 
     #[test]
     fn expect_100_continue_is_answered_before_the_body_is_read() {
-        let raw = "POST /v1/unban HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n{}";
-        let mut asked = 0;
-        read_request(&mut Cursor::new(raw.as_bytes().to_vec()), || asked += 1).expect("parses");
-        assert_eq!(asked, 1);
+        let head = b"POST /v1/unban HTTP/1.1\r\nExpect: 100-continue\r\nContent-Length: 2\r\n\r\n";
+        let mut c = TestConn::pieces(&[head, b"{}"]);
+        let r = read_request(&mut c, Instant::now() + Duration::from_secs(5)).expect("parses");
+        assert_eq!(r.body, b"{}");
+        assert_eq!(c.written(), "HTTP/1.1 100 Continue\r\n\r\n");
+    }
+
+    #[test]
+    fn the_review_cases_are_refused() {
+        for (raw, why) in [
+            (
+                "POST /v1/unban HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 2\r\n\r\n{}",
+                "a duplicate Content-Length",
+            ),
+            (
+                "POST /v1/unban HTTP/1.1\r\nContent-Length: 2\r\nContent-Length: 3\r\n\r\n{}",
+                "conflicting Content-Lengths",
+            ),
+            (
+                "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n",
+                "a duplicate Host",
+            ),
+            (
+                "GET / HTTP/1.1\r\nBad Name: x\r\n\r\n",
+                "a space in a header name",
+            ),
+            (
+                "GET / HTTP/1.1\r\nX(y): z\r\n\r\n",
+                "a separator in a header name",
+            ),
+            ("GET / HTTP/1.1\nHost: x\n\n", "bare LF line endings"),
+            ("GET / HTTP/1.1\r\nHost: x\n\r\n", "a bare LF mid-head"),
+            ("GET / HTTP/1.1\r\nHost: x\rY: z\r\n\r\n", "a bare CR"),
+            (
+                "GET / HTTP/1.1\r\nContent-Length: +2\r\n\r\n{}",
+                "a signed length",
+            ),
+        ] {
+            let status = parse(raw).expect_err(why).status;
+            assert!(status == 400, "{why}: got {status}");
+        }
+        let te =
+            "POST /v1/unban HTTP/1.1\r\nContent-Length: 2\r\nTransfer-Encoding: identity\r\n\r\n{}";
+        assert_eq!(parse(te).expect_err("any TE").status, 411);
+    }
+
+    #[test]
+    fn too_many_header_lines_are_431() {
+        let raw = format!(
+            "GET / HTTP/1.1\r\n{}\r\n",
+            (0..=MAX_HEADERS)
+                .map(|i| format!("X-{i}: y\r\n"))
+                .collect::<String>()
+        );
+        assert_eq!(parse(&raw).expect_err("too many").status, 431);
+    }
+
+    /// The deadline covers the whole request: a client that keeps sending a
+    /// byte at a time, each well inside the per-read timeout, is still cut off.
+    #[test]
+    fn a_trickling_client_is_cut_off_at_the_deadline() {
+        let raw = "GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n";
+        let bytes: Vec<&[u8]> = raw.as_bytes().chunks(1).collect();
+        let mut c = TestConn::pieces(&bytes);
+        c.delay = Duration::from_millis(30);
+        let start = Instant::now();
+        let e = read_request(&mut c, start + Duration::from_millis(300)).expect_err("cut off");
+        assert_eq!(e.status, 408);
+        assert!(
+            start.elapsed() < Duration::from_millis(600),
+            "{:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
     fn a_whole_connection_gets_one_complete_response_and_closes() {
-        let mut out = Vec::new();
-        handle_connection(
-            Cursor::new(b"GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n".to_vec()),
-            &mut out,
-            &up(),
-            OFF,
-        );
-        let text = String::from_utf8(out).expect("utf-8");
+        let mut c = TestConn::new("GET /v1/health HTTP/1.1\r\nHost: x\r\n\r\n");
+        handle_connection(&mut c, &up(), &off());
+        let text = c.written();
         let (head, body) = text.split_once("\r\n\r\n").expect("head and body");
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{head}");
         assert!(head.contains("Connection: close"), "{head}");
@@ -1122,6 +1417,71 @@ mod tests {
             body,
             format!(r#"{{"ok":true,"version":"{}"}}"#, env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    // ── host and token ─────────────────────────────────────────────────────
+
+    #[test]
+    fn only_the_configured_hosts_are_answered() {
+        let mut r = get("/v1/blocks");
+        assert_eq!(route(&r, &up(), &off()).status, 200);
+        r.headers = vec![("host".into(), "127.0.0.1:9060".to_uppercase())];
+        assert_eq!(route(&r, &up(), &off()).status, 200, "case does not matter");
+        r.headers = vec![("host".into(), "evil.example:9060".into())];
+        assert_eq!(
+            route(&r, &up(), &off()).status,
+            403,
+            "a rebinding page's name"
+        );
+        r.headers.clear();
+        assert_eq!(route(&r, &up(), &off()).status, 403, "no Host at all");
+    }
+
+    #[test]
+    fn the_default_hosts_are_the_listen_address_and_localhost_on_loopback() {
+        let lo = "127.0.0.1:9060".parse().unwrap();
+        assert_eq!(allowed_hosts(lo, &[]), ["127.0.0.1:9060", "localhost:9060"]);
+        let any = "192.0.2.1:80".parse().unwrap();
+        assert_eq!(
+            allowed_hosts(any, &[" Proxy.Example ".into()]),
+            ["192.0.2.1:80", "proxy.example"]
+        );
+    }
+
+    #[test]
+    fn a_token_guards_every_route_but_health() {
+        let o = Options {
+            token: Some("s3cret".into()),
+            ..off()
+        };
+        let with = |path: &str, auth: Option<&str>| {
+            let mut r = get(path);
+            if let Some(a) = auth {
+                r.headers.push(("authorization".into(), a.into()));
+            }
+            route(&r, &up(), &o)
+        };
+        let denied = with("/v1/blocks", None);
+        assert_eq!(denied.status, 401);
+        assert!(String::from_utf8(denied.to_bytes())
+            .unwrap()
+            .contains("\r\nWWW-Authenticate: Bearer\r\n"));
+        assert_eq!(with("/v1/blocks", Some("Bearer wrong")).status, 401);
+        assert_eq!(with("/v1/blocks", Some("Basic s3cret")).status, 401);
+        assert_eq!(with("/v1/blocks", Some("Bearer s3cret")).status, 200);
+        assert_eq!(
+            with("/metrics", Some("bearer s3cret")).status,
+            200,
+            "scheme is case-blind"
+        );
+        assert_eq!(with("/v1/health", None).status, 200, "health stays open");
+    }
+
+    #[test]
+    fn secrets_compare_equal_only_when_identical() {
+        assert!(same_secret(b"abc", b"abc"));
+        assert!(!same_secret(b"abc", b"abd"));
+        assert!(!same_secret(b"abc", b"abcd"));
     }
 
     // ── what every route refuses ───────────────────────────────────────────
@@ -1140,20 +1500,20 @@ mod tests {
             };
             r.headers
                 .push(("origin".into(), "http://evil.example".into()));
-            assert_eq!(route(&r, &up(), ON).status, 403, "{path}");
+            assert_eq!(route(&r, &up(), &on()).status, 403, "{path}");
         }
         assert!(up().unbanned.lock().unwrap().is_empty());
     }
 
     #[test]
     fn unknown_paths_are_404_and_wrong_methods_405() {
-        assert_eq!(route(&get("/v2/blocks"), &up(), ON).status, 404);
-        assert_eq!(route(&get("/"), &up(), ON).status, 404);
+        assert_eq!(route(&get("/v2/blocks"), &up(), &on()).status, 404);
+        assert_eq!(route(&get("/"), &up(), &on()).status, 404);
         let mut r = get("/v1/blocks");
         r.method = "DELETE".into();
-        let resp = route(&r, &up(), ON);
+        let resp = route(&r, &up(), &on());
         assert_eq!((resp.status, resp.allow), (405, Some("GET")));
-        let resp = route(&get("/v1/unban"), &up(), ON);
+        let resp = route(&get("/v1/unban"), &up(), &on());
         assert_eq!((resp.status, resp.allow), (405, Some("POST")));
         assert!(String::from_utf8(resp.to_bytes())
             .unwrap()
@@ -1164,7 +1524,7 @@ mod tests {
 
     #[test]
     fn health_names_the_version() {
-        let v = json(&route(&get("/v1/health"), &up(), OFF));
+        let v = json(&route(&get("/v1/health"), &up(), &off()));
         assert_eq!(v["ok"], true);
         assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
     }
@@ -1172,7 +1532,7 @@ mod tests {
     #[test]
     fn status_is_the_status_document_even_when_nothing_can_be_read() {
         let fake = Fake::default();
-        let r = route(&get("/v1/status"), &fake, OFF);
+        let r = route(&get("/v1/status"), &fake, &off());
         assert_eq!(r.status, 200);
         assert_eq!(r.body, crate::json_line(&fake.status()).unwrap());
         assert_eq!(json(&r)["enforcement"], "inactive");
@@ -1183,7 +1543,7 @@ mod tests {
     #[test]
     fn blocks_are_the_cli_lines_as_one_array() {
         let fake = up();
-        let r = route(&get("/v1/blocks"), &fake, OFF);
+        let r = route(&get("/v1/blocks"), &fake, &off());
         assert_eq!(r.status, 200);
         let lines: Vec<String> = fake
             .docs()
@@ -1198,11 +1558,17 @@ mod tests {
 
     #[test]
     fn one_block_by_address() {
-        let r = route(&get("/v1/blocks/203.0.113.2"), &up(), OFF);
+        let r = route(&get("/v1/blocks/203.0.113.2"), &up(), &off());
         assert_eq!(r.status, 200);
         assert_eq!(r.body, crate::json_line(&up().docs()[1]).unwrap());
-        assert_eq!(route(&get("/v1/blocks/192.0.2.1"), &up(), OFF).status, 404);
-        assert_eq!(route(&get("/v1/blocks/not-an-ip"), &up(), OFF).status, 400);
+        assert_eq!(
+            route(&get("/v1/blocks/192.0.2.1"), &up(), &off()).status,
+            404
+        );
+        assert_eq!(
+            route(&get("/v1/blocks/not-an-ip"), &up(), &off()).status,
+            400
+        );
     }
 
     #[test]
@@ -1214,7 +1580,7 @@ mod tests {
             "/v1/stats",
             "/v1/log",
         ] {
-            let r = route(&get(p), &down, OFF);
+            let r = route(&get(p), &down, &off());
             assert_eq!(r.status, 503, "{p}");
             assert!(json(&r)["error"].is_string(), "{p}");
         }
@@ -1223,7 +1589,7 @@ mod tests {
     #[test]
     fn the_log_takes_a_capped_limit_and_an_address() {
         let n = |q: &str| {
-            json(&route(&get(&format!("/v1/log{q}")), &up(), OFF))
+            json(&route(&get(&format!("/v1/log{q}")), &up(), &off()))
                 .as_array()
                 .unwrap()
                 .len()
@@ -1241,7 +1607,7 @@ mod tests {
             "?other=1",
         ] {
             assert_eq!(
-                route(&get(&format!("/v1/log{bad}")), &up(), OFF).status,
+                route(&get(&format!("/v1/log{bad}")), &up(), &off()).status,
                 400,
                 "{bad}"
             );
@@ -1253,7 +1619,7 @@ mod tests {
     #[test]
     fn unban_is_403_unless_allowed_and_nothing_is_touched() {
         let fake = up();
-        let r = route(&post_unban(r#"{"ips":["203.0.113.1"]}"#), &fake, OFF);
+        let r = route(&post_unban(r#"{"ips":["203.0.113.1"]}"#), &fake, &off());
         assert_eq!(r.status, 403);
         assert!(fake.unbanned.lock().unwrap().is_empty());
     }
@@ -1261,16 +1627,19 @@ mod tests {
     #[test]
     fn unban_takes_json_only() {
         let mut r = post_unban(r#"{"ips":["203.0.113.1"]}"#);
-        r.headers = vec![("content-type".into(), "text/plain".into())];
-        assert_eq!(route(&r, &up(), ON).status, 415);
-        r.headers.clear();
-        assert_eq!(route(&r, &up(), ON).status, 415);
-        r.headers = vec![(
-            "content-type".into(),
-            "Application/JSON; charset=utf-8".into(),
-        )];
+        r.headers = vec![host(), ("content-type".into(), "text/plain".into())];
+        assert_eq!(route(&r, &up(), &on()).status, 415);
+        r.headers = vec![host()];
+        assert_eq!(route(&r, &up(), &on()).status, 415);
+        r.headers = vec![
+            host(),
+            (
+                "content-type".into(),
+                "Application/JSON; charset=utf-8".into(),
+            ),
+        ];
         assert_eq!(
-            route(&r, &up(), ON).status,
+            route(&r, &up(), &on()).status,
             200,
             "parameters and case are fine"
         );
@@ -1293,7 +1662,7 @@ mod tests {
             r#"{"ips":["203.0.113.1"],"reason":"line\nbreak"}"#,
             too_many.as_str(),
         ] {
-            let r = route(&post_unban(body), &fake, ON);
+            let r = route(&post_unban(body), &fake, &on());
             assert_eq!(r.status, 400, "{body:.60}");
             assert!(json(&r)["error"].is_string());
         }
@@ -1303,13 +1672,13 @@ mod tests {
     #[test]
     fn unban_records_http_as_the_source_unless_told_otherwise() {
         let fake = up();
-        let r = route(&post_unban(r#"{"ips":["203.0.113.1"]}"#), &fake, ON);
+        let r = route(&post_unban(r#"{"ips":["203.0.113.1"]}"#), &fake, &on());
         assert_eq!(r.status, 200);
         assert_eq!(json(&r)[0]["source"], "http");
         let r = route(
             &post_unban(r#"{"ips":["203.0.113.2"],"source":"panel","reason":"customer asked"}"#),
             &fake,
-            ON,
+            &on(),
         );
         assert_eq!(json(&r)[0]["source"], "panel");
         let calls = fake.unbanned.lock().unwrap();
@@ -1325,13 +1694,13 @@ mod tests {
         let r = route(
             &post_unban(r#"{"ips":["203.0.113.1","203.0.113.2"]}"#),
             &up(),
-            ON,
+            &on(),
         );
         assert_eq!(r.status, 200);
         let r = route(
             &post_unban(r#"{"ips":["203.0.113.1","192.0.2.7"]}"#),
             &up(),
-            ON,
+            &on(),
         );
         assert_eq!(r.status, 422);
         let v = json(&r);
@@ -1348,7 +1717,7 @@ mod tests {
         let r = route(
             &post_unban(r#"{"ips":["203.0.113.1","203.0.113.2","203.0.113.3"]}"#),
             &fake,
-            ON,
+            &on(),
         );
         assert_eq!(r.status, 500);
         let v = json(&r);
@@ -1365,7 +1734,7 @@ mod tests {
                 db: true,
                 ..Fake::default()
             },
-            ON,
+            &on(),
         );
         assert_eq!(r.status, 503);
     }
@@ -1424,7 +1793,7 @@ mod tests {
 
     #[test]
     fn metrics_parse_and_carry_the_kernel_and_database_counts() {
-        let r = route(&get("/metrics"), &up(), OFF);
+        let r = route(&get("/metrics"), &up(), &off());
         assert_eq!(r.status, 200);
         assert!(r.content_type.starts_with("text/plain; version=0.0.4"));
         let m = parse_prometheus(&r.body);
@@ -1469,20 +1838,20 @@ mod tests {
         for call in ["banned(", "banned_one(", "stats(", "log("] {
             assert!(!body.contains(call), "{call} in metrics: {body}");
         }
-        assert!(!route(&get("/metrics"), &up(), OFF)
+        assert!(!route(&get("/metrics"), &up(), &off())
             .body
             .contains("203.0.113."));
     }
 
     #[test]
     fn metrics_omit_what_cannot_be_read_and_never_report_it_as_zero() {
-        let m = parse_prometheus(&route(&get("/metrics"), &Fake::default(), OFF).body);
+        let m = parse_prometheus(&route(&get("/metrics"), &Fake::default(), &off()).body);
         assert_eq!(m.len(), 1, "only build_info is left: {m:?}");
         let no_db = Fake {
             map: true,
             ..Fake::default()
         };
-        let m = parse_prometheus(&route(&get("/metrics"), &no_db, OFF).body);
+        let m = parse_prometheus(&route(&get("/metrics"), &no_db, &off()).body);
         assert!(
             m.contains_key("tfps_blocked_sources"),
             "the kernel half stands alone"
@@ -1494,7 +1863,7 @@ mod tests {
 
     #[test]
     fn a_reason_label_is_escaped_on_the_page() {
-        let body = route(&get("/metrics"), &up(), OFF).body;
+        let body = route(&get("/metrics"), &up(), &off()).body;
         assert!(
             body.contains(r#"tfps_blocks_logged{window="24h",reason="weird \"reason\"\n"} 1"#),
             "{body}"
@@ -1542,7 +1911,7 @@ mod tests {
     fn serve_answers_over_a_real_socket() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().unwrap();
-        std::thread::spawn(move || serve(listener, Arc::new(up()), OFF));
+        std::thread::spawn(move || serve(listener, Arc::new(up()), off()));
         let mut s = TcpStream::connect(addr).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         s.write_all(b"GET /v1/blocks/203.0.113.1 HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -1566,12 +1935,12 @@ mod tests {
             let c = TcpStream::connect(l.local_addr().unwrap()).unwrap();
             (c, l.accept().unwrap().0)
         };
-        server
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let w = server.try_clone().unwrap();
+        let o = Options {
+            deadline: Duration::from_millis(200),
+            ..off()
+        };
         let start = std::time::Instant::now();
-        handle_connection(server, w, &up(), OFF);
+        handle_connection(server, &up(), &o);
         assert!(start.elapsed() < Duration::from_secs(2));
         let mut out = String::new();
         client

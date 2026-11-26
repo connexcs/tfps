@@ -1228,7 +1228,7 @@ fn serve(args: &Args) -> Result<(), String> {
         // A broken file must not quietly turn into "the API is off".
         tfps::config::Loaded::Broken(e) => return Err(e),
     };
-    let Some((listen, opts)) = serve_settings(&http, args.listen, args.allow_unban) else {
+    let Some((listen, opts)) = serve_settings(&http, args.listen, args.allow_unban)? else {
         say!(
             "the HTTP API is off: set \"http\": {{\"enabled\": true}} in {} to serve it",
             args.config.display()
@@ -1280,20 +1280,56 @@ fn serve_ctx(args: &Args, config_db: Option<PathBuf>) -> Ctx {
 /// The listen address and options `serve` runs with, or `None` when the API is
 /// off. The command line beats the file, which beats the default; neither flag
 /// turns the API on by itself, so `enabled` stays the one switch.
+///
+/// Refuses to start rather than run exposed by mistake: a non-loopback address
+/// needs `allow_remote`, and a token file must hold a token and be readable by
+/// its owner only.
 fn serve_settings(
     http: &tfps::config::HttpConfig,
     listen: Option<std::net::SocketAddrV4>,
     allow_unban: bool,
-) -> Option<(std::net::SocketAddrV4, tfps::api::Options)> {
+) -> Result<Option<(std::net::SocketAddrV4, tfps::api::Options)>, String> {
     if !http.enabled {
-        return None;
+        return Ok(None);
     }
-    Some((
-        listen.unwrap_or(http.listen),
-        tfps::api::Options {
-            allow_unban: allow_unban || http.allow_unban,
-        },
-    ))
+    let listen = listen.unwrap_or(http.listen);
+    if !listen.ip().is_loopback() && !http.allow_remote {
+        return Err(format!(
+            "listening on {listen} would expose the API beyond this host; \
+             set \"allow_remote\": true in the http section to mean it"
+        ));
+    }
+    let token = http.token_file.as_deref().map(read_token).transpose()?;
+    Ok(Some((
+        listen,
+        tfps::api::Options::new(
+            allow_unban || http.allow_unban,
+            tfps::api::allowed_hosts(listen, &http.hosts),
+            token,
+        ),
+    )))
+}
+
+/// The bearer token in `path`: its first line, trimmed. Refused when the file
+/// is empty or readable by anyone but its owner, since anyone who can read it
+/// can use the API.
+fn read_token(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("token_file {}: {e}", path.display()))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "token_file {} is readable by others; chmod 600 it",
+            path.display()
+        ));
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("token_file {}: {e}", path.display()))?;
+    let token = text.lines().next().unwrap_or("").trim();
+    if token.is_empty() {
+        return Err(format!("token_file {} is empty", path.display()));
+    }
+    Ok(token.to_string())
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1987,26 +2023,81 @@ mod tests {
         let mut http = tfps::config::HttpConfig::default();
         assert_eq!(
             serve_settings(&http, None, true),
-            None,
+            Ok(None),
             "a flag does not turn it on"
         );
         http.enabled = true;
-        let (listen, opts) = serve_settings(&http, None, false).expect("on");
+        let (listen, opts) = serve_settings(&http, None, false).unwrap().expect("on");
         assert_eq!(listen.to_string(), "127.0.0.1:9060");
         assert!(
             !opts.allow_unban,
             "unban is a second switch, off by default"
         );
-        let other = "0.0.0.0:8080".parse().unwrap();
-        let (listen, opts) = serve_settings(&http, Some(other), true).expect("on");
+        assert_eq!(opts.hosts, ["127.0.0.1:9060", "localhost:9060"]);
+        assert_eq!(opts.token, None);
+        let other = "127.0.0.2:8080".parse().unwrap();
+        let (listen, opts) = serve_settings(&http, Some(other), true)
+            .unwrap()
+            .expect("on");
         assert_eq!((listen, opts.allow_unban), (other, true));
         http.allow_unban = true;
         assert!(
             serve_settings(&http, None, false)
+                .unwrap()
                 .expect("on")
                 .1
                 .allow_unban
         );
+    }
+
+    #[test]
+    fn a_non_loopback_listener_must_be_asked_for() {
+        let mut http = tfps::config::HttpConfig {
+            enabled: true,
+            hosts: vec!["TFPS.example.com".into()],
+            ..Default::default()
+        };
+        let remote = "0.0.0.0:9060".parse().unwrap();
+        let e = serve_settings(&http, Some(remote), false).expect_err("refused");
+        assert!(e.contains("allow_remote"), "{e}");
+        http.allow_remote = true;
+        let (_, opts) = serve_settings(&http, Some(remote), false)
+            .unwrap()
+            .expect("on");
+        assert_eq!(
+            opts.hosts,
+            ["0.0.0.0:9060", "tfps.example.com"],
+            "no localhost off loopback; extra names lower-cased"
+        );
+    }
+
+    #[test]
+    fn the_token_file_must_be_private_and_not_empty() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        let set = |text: &str, mode: u32| {
+            std::fs::write(&file, text).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set("s3cret\n", 0o600);
+        assert_eq!(read_token(&file).as_deref(), Ok("s3cret"));
+        set("s3cret\n", 0o644);
+        assert!(read_token(&file).unwrap_err().contains("chmod 600"));
+        set("  \n", 0o600);
+        assert!(read_token(&file).unwrap_err().contains("empty"));
+        assert!(read_token(&dir.join("absent")).is_err());
+        let http = tfps::config::HttpConfig {
+            enabled: true,
+            token_file: Some(file.clone()),
+            ..Default::default()
+        };
+        set("abc\n", 0o600);
+        let (_, opts) = serve_settings(&http, None, false).unwrap().expect("on");
+        assert_eq!(opts.token.as_deref(), Some("abc"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

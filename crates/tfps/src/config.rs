@@ -138,9 +138,10 @@ pub const DEFAULT_HTTP_LISTEN: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALH
 /// The `http` section: `tfps_ctl serve`'s listener.
 ///
 /// **Off unless `enabled` is true**, and unbanning over HTTP is a second switch
-/// that is also off. There is no authentication in TFPS: anyone who can reach
-/// `listen` can read the blocks (and lift them, with `allow_unban`), so access
-/// beyond the local host is a reverse proxy's job.
+/// that is also off. Requests must name an allowed `Host` (the listen address,
+/// `localhost` on loopback, and `hosts`), which stops a DNS-rebinding web page;
+/// `token_file` adds a bearer token for machine-to-machine access. TLS stays a
+/// reverse proxy's job.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HttpConfig {
@@ -152,6 +153,19 @@ pub struct HttpConfig {
     /// Accept `POST /v1/unban`. Off: that route answers 403.
     #[serde(default)]
     pub allow_unban: bool,
+    /// Further `Host` values to accept, such as the name a reverse proxy passes
+    /// on (`"tfps.example.com"`, or `"tfps.example.com:8443"` when clients send
+    /// a port). The listen address, and `localhost` on loopback, need no entry.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Listening on a non-loopback address must be asked for explicitly: without
+    /// this, `serve` refuses to start rather than expose the API by a typo.
+    #[serde(default)]
+    pub allow_remote: bool,
+    /// A file holding a bearer token. When set, every route but `/v1/health`
+    /// needs `Authorization: Bearer <token>`. The file must be readable by its
+    /// owner only.
+    pub token_file: Option<PathBuf>,
 }
 
 impl Default for HttpConfig {
@@ -160,6 +174,9 @@ impl Default for HttpConfig {
             enabled: false,
             listen: DEFAULT_HTTP_LISTEN,
             allow_unban: false,
+            hosts: Vec::new(),
+            allow_remote: false,
+            token_file: None,
         }
     }
 }
@@ -326,6 +343,20 @@ mod tests {
                 .expect("present");
         assert!(h.enabled && h.allow_unban);
         assert_eq!(h.listen.to_string(), "0.0.0.0:8080");
+        assert!(!h.allow_remote && h.hosts.is_empty() && h.token_file.is_none());
+        let h = parse(
+            r#"{"http": {"hosts": ["tfps.example.com"], "allow_remote": true,
+                         "token_file": "/etc/tfps/api-token"}}"#,
+        )
+        .expect("parses")
+        .http
+        .expect("present");
+        assert_eq!(h.hosts, ["tfps.example.com"]);
+        assert!(h.allow_remote);
+        assert_eq!(
+            h.token_file.as_deref(),
+            Some(Path::new("/etc/tfps/api-token"))
+        );
     }
 
     /// The file the installer writes when there is none must load. If it did
