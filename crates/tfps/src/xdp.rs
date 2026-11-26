@@ -476,20 +476,19 @@ impl Blocklist {
         lookup_result(self.map.get(&self.key(ip), 0), ip)
     }
 
-    // `remove` below keeps its own check: it predates `get` and its callers
-    // already distinguish its errors from "was not there".
-
     /// Lifts a block. Returns whether the address was there — an operator who typos an
     /// address must be told nothing happened, not left believing they unbanned someone.
+    ///
+    /// Only a missing key is "was not there"; any other failure to read or remove
+    /// is an error, so a map that cannot be used is never reported as having
+    /// nothing to lift. A block that expires between the check and the removal
+    /// was not lifted by us, and reads as not there.
     pub fn remove(&mut self, ip: Ipv4Addr) -> Result<bool, String> {
         let k = self.key(ip);
-        if self.map.get(&k, 0).is_err() {
+        if lookup_result(self.map.get(&k, 0), ip)?.is_none() {
             return Ok(false);
         }
-        self.map
-            .remove(&k)
-            .map(|()| true)
-            .map_err(|e| format!("removing {ip}: {e}"))
+        removal_result(self.map.remove(&k), ip)
     }
 
     /// Condemns a source by hand, with the same TTL semantics the daemon uses.
@@ -636,6 +635,16 @@ fn collect_entries(
     Ok(out)
 }
 
+/// A map removal's answer: removed, a key already gone (it expired in between),
+/// or an error.
+fn removal_result(r: Result<(), MapError>, ip: Ipv4Addr) -> Result<bool, String> {
+    match r {
+        Ok(()) => Ok(true),
+        Err(MapError::KeyNotFound) => Ok(false),
+        Err(e) => Err(format!("removing {ip}: {e}")),
+    }
+}
+
 /// A map lookup's answer: the value, `None` for a key that is not there, and an
 /// error for anything else.
 fn lookup_result(r: Result<u64, MapError>, ip: Ipv4Addr) -> Result<Option<u64>, String> {
@@ -709,6 +718,14 @@ mod tests {
         })
         .expect_err("one unreadable counter");
         assert!(e.contains("seen"), "{e}");
+    }
+
+    #[test]
+    fn a_removal_tells_a_vanished_key_from_a_failure() {
+        let ip = Ipv4Addr::new(203, 0, 113, 1);
+        assert_eq!(removal_result(Ok(()), ip), Ok(true));
+        assert_eq!(removal_result(Err(MapError::KeyNotFound), ip), Ok(false));
+        assert!(removal_result(Err(MapError::ElementNotFound), ip).is_err());
     }
 
     #[test]
