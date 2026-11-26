@@ -49,6 +49,30 @@ impl Default for Ctx {
     }
 }
 
+/// The addresses in a block map read, as the store's lookups take them.
+pub fn map_addresses(entries: &[(Ipv4Addr, u64)]) -> std::collections::HashSet<String> {
+    entries.iter().map(|(ip, _)| ip.to_string()).collect()
+}
+
+/// The audit log's answers per address, split the way attribution uses them:
+/// `ip -> (reason, detail, first_seen)` for `banned_attribution`, and
+/// `ip -> newest block time` for `manual_attribution`.
+#[allow(clippy::type_complexity)]
+pub fn audit_maps(
+    summaries: std::collections::HashMap<String, crate::store::BlockSummary>,
+) -> (
+    std::collections::HashMap<String, (String, String, u32)>,
+    std::collections::HashMap<String, u32>,
+) {
+    let mut audit = std::collections::HashMap::with_capacity(summaries.len());
+    let mut newest = std::collections::HashMap::with_capacity(summaries.len());
+    for (ip, s) in summaries {
+        newest.insert(ip.clone(), s.newest);
+        audit.insert(ip, (s.reason, s.detail, s.first_seen));
+    }
+    (audit, newest)
+}
+
 /// The block map `ctx` names: an explicit pin as given, else the configured
 /// shared map with the daemon's fallback, else the usual lookup.
 fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
@@ -83,21 +107,19 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
         .ok()
         .map(|c| (c.seen, c.dropped, c.expired));
     let s = Store::open_readonly(&ctx.db)?;
-    let apiban = s.apiban_all().unwrap_or_default();
-    let audit: std::collections::HashSet<String> = s
-        .blocks(1_000_000, None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r.ip)
-        .collect();
     // `null`, not `(0, 0, 0)`, when the blocklist map cannot be opened —
     // the same reason `kernel` above is `None` rather than zeroed: a
     // consumer reading `condemned_now: 0` off a box whose map could not
     // even be opened would conclude nothing is blocked, the exact wrong
-    // reading this null is here to prevent.
-    let condemnation = open_blocklist(ctx)
-        .ok()
-        .map(|b| condemnation_counts(&b.entries(), &audit, &apiban));
+    // reading this null is here to prevent. The audit log and the feed are
+    // asked only about the addresses in the map.
+    let condemnation = open_blocklist(ctx).ok().map(|b| {
+        let entries = b.entries();
+        let among = map_addresses(&entries);
+        let audit = s.logged_among(&among).unwrap_or_default();
+        let apiban = s.apiban_among(&among).unwrap_or_default();
+        condemnation_counts(&entries, &audit, &apiban)
+    });
     let now = now();
     let stats_line = s.meta_get("stats");
     let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
@@ -115,7 +137,7 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
     let (countries, intl_calls) = s.country_spread()?;
     let window = |since: u32| s.blocks_by_reason(now.saturating_sub(since));
     let blocks = blocks_doc(
-        apiban.len(),
+        s.apiban_count().unwrap_or(0),
         window(3600)?,
         window(86_400)?,
         window(604_800)?,
@@ -144,18 +166,20 @@ pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
     // Both sets are loaded for the same reason the human path loads both: an
     // address on the feed alone is attributable, and reading only the audit
     // log reports it as unattributed.
+    // The audit log and the feed are asked only about what the map holds.
     let store = Store::open_readonly(&ctx.db).ok();
-    let rows = store
-        .as_ref()
-        .and_then(|s| s.blocks(1_000_000, None).ok())
-        .unwrap_or_default();
+    let among = map_addresses(&entries);
+    let (audit, newest) = audit_maps(
+        store
+            .as_ref()
+            .and_then(|s| s.block_summaries(&among).ok())
+            .unwrap_or_default(),
+    );
     let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
     let manual = manual_record(ctx, &wanted);
-    let newest = newest_audit_ts(&rows, &manual_banned(&manual));
-    let audit = attribute_by_ip(rows);
     let apiban = store
         .as_ref()
-        .and_then(|s| s.apiban_all().ok())
+        .and_then(|s| s.apiban_among(&among).ok())
         .unwrap_or_default();
     let now_wall = now();
     let now_mono = monotonic_ns();
@@ -194,10 +218,13 @@ pub fn log_docs(ctx: &Ctx, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>
         .collect())
 }
 
-/// `block_log` rows by reason, over everything the log still retains (the
-/// daemon prunes it on the audit window). For `/metrics`.
-pub fn block_log_counts(ctx: &Ctx) -> Result<Vec<(String, u32)>, String> {
-    Store::open_readonly(&ctx.db)?.blocks_by_reason(0)
+/// `(blocked now, of which permanent)`, counted from the block map alone. For
+/// `/metrics`: the map is the state of the system, and counting it reads no
+/// database and moves no address anywhere.
+pub fn map_counts(ctx: &Ctx) -> Result<(usize, usize), String> {
+    let entries = open_blocklist(ctx)?.entries();
+    let permanent = entries.iter().filter(|(_, until)| *until == 0).count();
+    Ok((entries.len(), permanent))
 }
 
 /// Which blocks `unban_docs` lifts.
@@ -633,11 +660,9 @@ pub fn traffic_doc(line: Option<&str>, ts: Option<u32>, now: u32) -> Option<Traf
 /// document that rendered one command's times as integers and another's as
 /// formatted strings would make it guess which it had been handed.
 ///
-/// `first_seen` is read from the audit log via `Store::blocks(1_000_000, None)`,
-/// which is `ORDER BY ts DESC LIMIT 1000000`: on a box with more than a million
-/// audit rows the truncation drops the OLDEST rows, and those are precisely the
-/// ones `first_seen` reads from, so it would report the oldest row still within
-/// the limit rather than the oldest there is.
+/// `first_seen` is the time of the oldest audit row for the address the log
+/// still holds, and `reason`/`detail` come from its newest row
+/// (`Store::block_summaries`, asked only about the addresses in the block map).
 #[derive(Serialize)]
 pub struct BannedDoc {
     pub ip: String,
@@ -713,29 +738,6 @@ pub fn manual_attribution(
     Some(("manual".to_string(), detail, a.source.clone()))
 }
 
-/// The newest audit row's time for each address in `candidates`, from rows
-/// in any order.
-///
-/// Only addresses with a manual ban need it, so only those are looked up: with no
-/// manual bans the rows are not walked at all, and otherwise each row costs one
-/// lookup and allocates nothing unless it is a candidate.
-pub fn newest_audit_ts(
-    rows: &[BlockRow],
-    candidates: &std::collections::HashSet<String>,
-) -> std::collections::HashMap<String, u32> {
-    let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    if candidates.is_empty() {
-        return m;
-    }
-    for r in rows {
-        if candidates.contains(r.ip.as_str()) {
-            let e = m.entry(r.ip.clone()).or_insert(r.ts);
-            *e = (*e).max(r.ts);
-        }
-    }
-    m
-}
-
 /// The manual-unban records for addresses `unban` actually removed.
 pub fn manual_unbans(
     removed: &[(Ipv4Addr, bool)],
@@ -776,17 +778,6 @@ pub fn manual_record(
     found.by_ip
 }
 
-/// The addresses whose latest manual action is a ban, as `newest_audit_ts` takes them.
-pub fn manual_banned(
-    manual: &std::collections::HashMap<Ipv4Addr, crate::manual_log::ManualAction>,
-) -> std::collections::HashSet<String> {
-    manual
-        .iter()
-        .filter(|(_, a)| a.verb == crate::manual_log::ManualVerb::Ban)
-        .map(|(ip, _)| ip.to_string())
-        .collect()
-}
-
 /// The record directory: `manual_log_dir` from the configuration file, else the
 /// database's directory; the same rule the daemon uses.
 pub fn manual_dir(ctx: &Ctx) -> std::path::PathBuf {
@@ -813,35 +804,6 @@ pub fn record_manual(ctx: &Ctx, actions: &[crate::manual_log::ManualAction]) {
             actions.len()
         );
     }
-}
-
-/// Attributes each ip to its most recent reason/detail and its earliest
-/// first-seen time, from a newest-first list of audit rows.
-///
-/// `reason`/`detail` take the newest row per ip — the same "most recent reason
-/// wins" precedence `--why` already uses in `tfps_ctl banned`'s human path.
-/// `first_seen` takes the OLDEST row instead: the plain meaning of the name
-/// is "when we first saw this source", not "when we most recently
-/// classified it". There is no equivalent "oldest wins" scan anywhere else
-/// in `tfps_ctl`; this is new logic and is pinned by its own test rather
-/// than only being exercised indirectly through `banned_doc`.
-///
-/// Assumes `rows` is ordered newest-first, exactly what `Store::blocks`
-/// returns: a running overwrite of `first_seen` on every subsequent
-/// occurrence of an ip converges on the oldest row by the time the scan
-/// ends, including across a duplicate timestamp.
-pub fn attribute_by_ip(
-    rows: Vec<BlockRow>,
-) -> std::collections::HashMap<String, (String, String, u32)> {
-    let mut audit: std::collections::HashMap<String, (String, String, u32)> =
-        std::collections::HashMap::new();
-    for r in rows {
-        audit
-            .entry(r.ip)
-            .and_modify(|(_, _, first_seen)| *first_seen = r.ts)
-            .or_insert((r.reason, r.detail, r.ts));
-    }
-    audit
 }
 
 /// Turns a kernel blocklist expiry into wall-clock epoch seconds, or `None`
@@ -1167,85 +1129,6 @@ mod tests {
         assert_eq!(
             crate::json_line(&bare).unwrap(),
             r#"{"ip":"198.51.100.12","reason":null,"detail":null,"first_seen":null,"expires":null,"enforced":true}"#
-        );
-    }
-
-    // The merge `banned --json` uses to turn a newest-first audit scan into a
-    // per-ip (rule, detail, first_seen): `rule`/`detail` take the newest row
-    // per ip; `first_seen` takes the OLDEST row instead. This is genuinely
-    // new logic (no equivalent "oldest wins" scan exists in the human path),
-    // so it is pinned directly rather than only through `banned_doc`, which
-    // never sees more than one row at a time.
-    #[test]
-    fn attribute_by_ip_takes_the_newest_reason_and_the_oldest_first_seen() {
-        let rows = vec![
-            // ip A: three rows for one source, arriving newest-first — the
-            // order `Store::blocks` actually returns.
-            BlockRow {
-                ts: 300,
-                ip: "198.51.100.10".to_string(),
-                reason: "scanner".to_string(),
-                detail: "d3".to_string(),
-            },
-            BlockRow {
-                ts: 200,
-                ip: "198.51.100.10".to_string(),
-                reason: "user-agent".to_string(),
-                detail: "d2".to_string(),
-            },
-            BlockRow {
-                ts: 100,
-                ip: "198.51.100.10".to_string(),
-                reason: "injection".to_string(),
-                detail: "d1".to_string(),
-            },
-            // ip B: a single row — its one row is both the newest and the
-            // oldest at once.
-            BlockRow {
-                ts: 500,
-                ip: "198.51.100.11".to_string(),
-                reason: "auth-failed".to_string(),
-                detail: "db".to_string(),
-            },
-            // ip C: two rows sharing one timestamp — a duplicate the merge
-            // must not choke on.
-            BlockRow {
-                ts: 400,
-                ip: "198.51.100.12".to_string(),
-                reason: "reg-scan".to_string(),
-                detail: "first".to_string(),
-            },
-            BlockRow {
-                ts: 400,
-                ip: "198.51.100.12".to_string(),
-                reason: "reg-scan".to_string(),
-                detail: "second".to_string(),
-            },
-        ];
-        let audit = attribute_by_ip(rows);
-
-        let a = audit.get("198.51.100.10").expect("ip A is present");
-        assert_eq!(a.0, "scanner", "rule takes the newest row");
-        assert_eq!(a.1, "d3", "detail takes the newest row");
-        assert_eq!(a.2, 100, "first_seen takes the OLDEST row, not the newest");
-
-        let b = audit.get("198.51.100.11").expect("ip B is present");
-        assert_eq!(
-            b,
-            &("auth-failed".to_string(), "db".to_string(), 500),
-            "a single row is both its own newest and its own oldest"
-        );
-
-        let c = audit.get("198.51.100.12").expect("ip C is present");
-        assert_eq!(
-            c.1, "first",
-            "a duplicate timestamp keeps the first row seen"
-        );
-        assert_eq!(c.2, 400, "first_seen still resolves across the duplicate");
-
-        assert!(
-            attribute_by_ip(Vec::new()).is_empty(),
-            "no audit rows means no attribution, not a panic"
         );
     }
 
@@ -1626,7 +1509,7 @@ mod tests {
 
     /// The perimeter/feed split `stats --json`'s condemnation summary uses,
     /// pinned directly with concrete addresses — the same reason
-    /// `attribute_by_ip` and `expires_epoch` above are tested on their own
+    /// `expires_epoch` above is tested on its own
     /// rather than only indirectly through `stats_doc`, which never sees more
     /// than the three already-computed counts.
     #[test]
@@ -1766,34 +1649,6 @@ mod tests {
             }
         }
         m
-    }
-
-    fn row(ts: u32, ip: &str) -> BlockRow {
-        BlockRow {
-            ts,
-            ip: ip.to_string(),
-            reason: "user-agent".to_string(),
-            detail: "friendly-scanner".to_string(),
-        }
-    }
-
-    #[test]
-    fn the_newest_daemon_block_is_looked_up_only_for_manual_banned_addresses() {
-        let rows = [
-            row(300, "203.0.113.1"),
-            row(200, "203.0.113.2"),
-            row(100, "203.0.113.1"),
-        ];
-        let candidates: std::collections::HashSet<String> = ["203.0.113.1".to_string()].into();
-        let newest = newest_audit_ts(&rows, &candidates);
-        assert_eq!(newest.len(), 1, "{newest:?}");
-        assert_eq!(newest["203.0.113.1"], 300);
-    }
-
-    #[test]
-    fn with_no_manual_bans_the_audit_rows_are_not_walked_again() {
-        let rows = [row(300, "203.0.113.1")];
-        assert!(newest_audit_ts(&rows, &std::collections::HashSet::new()).is_empty());
     }
 
     #[test]

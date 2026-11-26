@@ -576,13 +576,15 @@ database cannot be read). `/v1/unban` answers with one `unban --json` document p
 request; `source` defaults to `http`, and every unban lands in the same
 `manual_actions-YYYYMM.jsonl` record as one from the command line.
 
-`/metrics` exports the kernel counters (`tfps_xdp_seen_total`, `tfps_xdp_dropped_total`,
-`tfps_xdp_expired_total`), the blocks now (`tfps_blocked_sources{kind="manual|audit|apiban|unattributed"}`,
-`tfps_blocked_sources_permanent`), the retained audit log by reason
-(`tfps_block_log_entries`, a gauge, since the log is pruned), the daemon's traffic counters
-as of its last checkpoint (`tfps_traffic_total{counter=…}`) with
-`tfps_checkpoint_timestamp_seconds` so staleness is visible, the learned totals and
-`tfps_build_info`. A value that cannot be read is left out, never reported as 0.
+`/metrics` reflects the kernel and nothing else: the XDP counters (`tfps_xdp_seen_total`,
+`tfps_xdp_dropped_total`, `tfps_xdp_expired_total`), the number of sources in the block map
+now (`tfps_blocked_sources`) and how many of them never expire
+(`tfps_blocked_sources_permanent`), and `tfps_build_info`. It reads no database and no
+address leaves the map, so a scrape costs the same however long the audit log grows. A value
+that cannot be read is left out, never reported as 0.
+
+`/v1/blocks` and `/v1/stats` start from the block map too, and ask the audit log and the
+APIBAN feed only about the addresses in it.
 
 ### Security model — read this before exposing it
 

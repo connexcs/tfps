@@ -20,8 +20,8 @@ use std::process::ExitCode;
 use serde::Serialize;
 
 use tfps::ctl::{
-    action_doc, banned_docs, finite, log_docs, manual_attribution, manual_banned, manual_record,
-    newest_audit_ts, now, record_manual, stats_docs, status_docs, unban_docs, ActionDoc, Ctx,
+    action_doc, audit_maps, banned_docs, finite, log_docs, manual_attribution, manual_record,
+    map_addresses, now, record_manual, stats_docs, status_docs, unban_docs, ActionDoc, Ctx,
     UnbanOutcome, UnbanTarget,
 };
 use tfps::say;
@@ -317,17 +317,14 @@ fn stats(args: &Args) -> Result<(), String> {
         Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
     }
     let s = Store::open_readonly(&args.db)?;
-    let apiban = s.apiban_all().unwrap_or_default();
-    // A perimeter block often lands on an IP that is also on the feed; attribute it to the
-    // reason we condemned it (the audit log), not to the feed it happens to appear on.
-    let audit: std::collections::HashSet<String> = s
-        .blocks(1_000_000, None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r.ip)
-        .collect();
     if let Ok(b) = Blocklist::open(args.map.as_deref()) {
         let e = b.entries();
+        // A perimeter block often lands on an IP that is also on the feed; attribute it to the
+        // reason we condemned it (the audit log), not to the feed it happens to appear on.
+        // Both are asked only about the addresses in the map.
+        let among = map_addresses(&e);
+        let audit = s.logged_among(&among).unwrap_or_default();
+        let apiban = s.apiban_among(&among).unwrap_or_default();
         let perimeter = e
             .iter()
             .filter(|(ip, _)| audit.contains(&ip.to_string()))
@@ -400,7 +397,7 @@ fn stats(args: &Args) -> Result<(), String> {
     say!(
         "  {:<16} {:>10}  {}",
         "apiban (feed)",
-        apiban.len(),
+        s.apiban_count().unwrap_or(0),
         "permanent, not audit-logged"
     );
     for (label, since) in [
@@ -481,25 +478,22 @@ fn banned(args: &Args) -> Result<(), String> {
     // Attribute each block once, block_log winning over the APIBAN feed — a scanner is
     // often on both (APIBAN's honeypots catch the same tools), and the *reason* we
     // condemned it is the perimeter one, not the feed. Load both sets once.
+    // The audit log and the feed are asked only about the addresses in the map.
     let store = Store::open_readonly(&args.db).ok();
+    let among = map_addresses(&entries);
     let apiban = store
         .as_ref()
-        .and_then(|s| s.apiban_all().ok())
+        .and_then(|s| s.apiban_among(&among).ok())
         .unwrap_or_default();
-    // ip -> (reason, detail), most recent block per ip (rows come newest-first).
-    let mut audit: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    // ip -> (reason, detail, first_seen) from its most recent block, and ip -> that block's time.
+    let (audit, newest) = audit_maps(
+        store
+            .as_ref()
+            .and_then(|s| s.block_summaries(&among).ok())
+            .unwrap_or_default(),
+    );
     let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
     let manual = manual_record(&args.ctx(), &wanted);
-    let mut newest: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    if let Some(s) = store.as_ref() {
-        if let Ok(rows) = s.blocks(1_000_000, None) {
-            newest = newest_audit_ts(&rows, &manual_banned(&manual));
-            for r in rows {
-                audit.entry(r.ip).or_insert((r.reason, r.detail));
-            }
-        }
-    }
 
     let now_ns = monotonic_ns();
     let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
@@ -523,7 +517,7 @@ fn banned(args: &Args) -> Result<(), String> {
         }
         let why = if let Some((_, detail, source)) = by_manual {
             format!("manual ({detail}) by {source}")
-        } else if let Some((reason, detail)) = by_audit {
+        } else if let Some((reason, detail, _)) = by_audit {
             format!("{reason} ({detail})")
         } else if by_feed {
             "apiban (feed)".to_string()

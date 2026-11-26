@@ -310,20 +310,19 @@ impl Blocklist {
                 });
             }
         }
-        let (id, map) = Self::open_by_name("blocked")?;
-        Ok(Self {
-            map,
-            big_endian: false,
-            source: format!("own map id {id}"),
-        })
+        Self::open_own()
     }
 
     /// The map the daemon enforces through when it was given a shared map (`drop_map`
-    /// or `--drop-map`): that pin when it exists and opens, else the usual lookup.
+    /// or `--drop-map`): that pin when it exists and opens, else the daemon's own map.
     ///
     /// The same test `Enforcer::attach` applies. A pin that is present but unusable
     /// (stale, or not a `hash<u32,u64>`) makes the daemon fall back to its own map,
     /// so reading that pin instead would show, and unban from, a map nothing enforces.
+    ///
+    /// The fallback goes **straight to the daemon's own map**, not through
+    /// [`Blocklist::open`]'s usual lookup: that lookup tries the default shared pin
+    /// first, which the daemon never considers once it has been given another one.
     pub fn open_preferring(pin: &Path) -> Result<Self, String> {
         if pin.exists() {
             if let Ok(map) = Self::open_pin(pin) {
@@ -334,7 +333,17 @@ impl Blocklist {
                 });
             }
         }
-        Self::open(None)
+        Self::open_own()
+    }
+
+    /// The daemon's own map, found by name.
+    fn open_own() -> Result<Self, String> {
+        let (id, map) = Self::open_by_name("blocked")?;
+        Ok(Self {
+            map,
+            big_endian: false,
+            source: format!("own map id {id}"),
+        })
     }
 
     fn open_pin(p: &Path) -> Result<BpfHashMap<MapData, u32, u64>, String> {

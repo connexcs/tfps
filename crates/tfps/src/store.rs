@@ -69,6 +69,18 @@ pub struct BlockRow {
     pub detail: String,
 }
 
+/// What the audit log says about one address: the reason and detail of its
+/// newest row, and the times of its newest and oldest rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSummary {
+    pub reason: String,
+    pub detail: String,
+    /// When it was most recently blocked.
+    pub newest: u32,
+    /// When it was first blocked, as far back as the log still reaches.
+    pub first_seen: u32,
+}
+
 /// How an operator narrows a source search.
 pub struct SourceFilter<'a> {
     pub peer: Option<&'a str>,
@@ -347,6 +359,42 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
+    /// How many addresses the APIBAN feed holds, counted in SQLite.
+    pub fn apiban_count(&self) -> Result<usize, String> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM apiban_ip", [], |r| r.get::<_, i64>(0))
+            .map(|n| usize::try_from(n).unwrap_or(0))
+            .map_err(|e| format!("counting apiban_ip: {e}"))
+    }
+
+    /// Which of `among` are on the APIBAN feed.
+    ///
+    /// The feed is streamed and only matches are kept, so memory follows the size
+    /// of `among` (the kernel block map), not the size of the feed.
+    pub fn apiban_among(
+        &self,
+        among: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let mut out = std::collections::HashSet::new();
+        if among.is_empty() {
+            return Ok(out);
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT ip FROM apiban_ip")
+            .map_err(|e| format!("reading apiban_ip: {e}"))?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("iterating apiban_ip: {e}"))?;
+        for row in rows {
+            let ip = row.map_err(|e| format!("reading apiban_ip: {e}"))?;
+            if among.contains(&ip) {
+                out.insert(ip);
+            }
+        }
+        Ok(out)
+    }
+
     /// Drops feed entries older than the retention window.
     pub fn apiban_prune(&self, older_than: u32) -> usize {
         self.conn
@@ -519,6 +567,80 @@ impl Store {
         Ok(rows.flatten().collect())
     }
 
+    /// What the audit log says about each of `among` that it mentions.
+    ///
+    /// SQLite reduces the log to one row per address (newest row's reason and
+    /// detail, newest and oldest time) and only the addresses in `among` are kept,
+    /// so memory follows the size of `among` (the kernel block map), not the
+    /// length of the log. Two rows with the same time are ordered by insertion:
+    /// the later-written one is the newer.
+    pub fn block_summaries(
+        &self,
+        among: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashMap<String, BlockSummary>, String> {
+        let mut out = std::collections::HashMap::new();
+        if among.is_empty() {
+            return Ok(out);
+        }
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT ip, reason, detail, ts, first_seen FROM (
+                     SELECT ip, reason, detail, ts,
+                            MIN(ts) OVER (PARTITION BY ip) AS first_seen,
+                            ROW_NUMBER() OVER (PARTITION BY ip ORDER BY ts DESC, rowid DESC) AS rn
+                     FROM block_log
+                 ) WHERE rn = 1",
+            )
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    BlockSummary {
+                        reason: r.get(1)?,
+                        detail: r.get(2)?,
+                        newest: r.get(3)?,
+                        first_seen: r.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("iterating block_log: {e}"))?;
+        for row in rows {
+            let (ip, summary) = row.map_err(|e| format!("reading block_log: {e}"))?;
+            if among.contains(&ip) {
+                out.insert(ip, summary);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Which of `among` the audit log mentions at all. Streamed like
+    /// `block_summaries`, without sorting each address's rows.
+    pub fn logged_among(
+        &self,
+        among: &std::collections::HashSet<String>,
+    ) -> Result<std::collections::HashSet<String>, String> {
+        let mut out = std::collections::HashSet::new();
+        if among.is_empty() {
+            return Ok(out);
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT DISTINCT ip FROM block_log")
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let rows = st
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("iterating block_log: {e}"))?;
+        for row in rows {
+            let ip = row.map_err(|e| format!("reading block_log: {e}"))?;
+            if among.contains(&ip) {
+                out.insert(ip);
+            }
+        }
+        Ok(out)
+    }
+
     /// How many blocks happened since `ts`, grouped by reason. The shape of what the
     /// perimeter is actually catching, which one line of the periodic report cannot show.
     pub fn blocks_by_reason(&self, since: u32) -> Result<Vec<(String, u32)>, String> {
@@ -689,6 +811,77 @@ mod tests {
     fn invite(from: &str, dialed: &str) -> Vec<u8> {
         format!("INVITE sip:{dialed}@pbx SIP/2.0\r\nFrom: <sip:{from}@pbx>;tag=t\r\n\r\n")
             .into_bytes()
+    }
+
+    /// One row per address: the newest row's reason, the oldest row's time,
+    /// ties broken by insertion order, and nothing outside `among`.
+    #[test]
+    fn block_summaries_keep_only_the_asked_addresses_newest_reason_and_first_time() {
+        let p = tmp();
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).expect("open");
+        let a = std::net::Ipv4Addr::new(203, 0, 113, 1);
+        let b = std::net::Ipv4Addr::new(203, 0, 113, 2);
+        let c = std::net::Ipv4Addr::new(203, 0, 113, 3);
+        s.log_block(100, a, "scanner", "first").unwrap();
+        s.log_block(300, a, "user-agent", "newest").unwrap();
+        s.log_block(200, a, "auth_failure", "middle").unwrap();
+        s.log_block(500, b, "scanner", "written first").unwrap();
+        s.log_block(500, b, "injection", "written last").unwrap();
+        s.log_block(50, c, "scanner", "not asked about").unwrap();
+        let among: std::collections::HashSet<String> =
+            [a, b, std::net::Ipv4Addr::new(198, 51, 100, 1)]
+                .iter()
+                .map(|ip| ip.to_string())
+                .collect();
+        let got = s.block_summaries(&among).expect("reads");
+        assert_eq!(
+            got.len(),
+            2,
+            "c was not asked about; the third is not logged"
+        );
+        assert_eq!(
+            got[&a.to_string()],
+            BlockSummary {
+                reason: "user-agent".into(),
+                detail: "newest".into(),
+                newest: 300,
+                first_seen: 100,
+            }
+        );
+        let tie = &got[&b.to_string()];
+        assert_eq!(
+            (tie.detail.as_str(), tie.newest, tie.first_seen),
+            ("written last", 500, 500)
+        );
+        assert!(s.block_summaries(&Default::default()).unwrap().is_empty());
+        assert_eq!(
+            s.logged_among(&among).unwrap(),
+            [a.to_string(), b.to_string()].into_iter().collect()
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_feed_is_counted_and_matched_without_being_loaded_whole() {
+        let p = tmp();
+        let _ = std::fs::remove_file(&p);
+        let mut s = Store::open(&p).expect("open");
+        assert_eq!(s.apiban_count().unwrap(), 0);
+        let a = std::net::Ipv4Addr::new(198, 51, 100, 1);
+        let b = std::net::Ipv4Addr::new(198, 51, 100, 2);
+        s.apiban_add(&[a, b], 100).unwrap();
+        assert_eq!(s.apiban_count().unwrap(), 2);
+        let among = [a.to_string(), "203.0.113.9".to_string()]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            s.apiban_among(&among).unwrap(),
+            [a.to_string()].into_iter().collect()
+        );
+        drop(s);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
