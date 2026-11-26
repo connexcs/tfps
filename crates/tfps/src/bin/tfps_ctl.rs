@@ -111,6 +111,7 @@ impl Args {
         Ctx {
             db: self.db.clone(),
             map: self.map.clone(),
+            shared_map: None,
             config: self.config.clone(),
         }
     }
@@ -1255,10 +1256,7 @@ fn serve(args: &Args) -> Result<(), String> {
     tfps::api::serve(
         listener,
         std::sync::Arc::new(tfps::api::CtlBackend(serve_ctx(
-            args,
-            config_db,
-            config_map,
-            Path::exists,
+            args, config_db, config_map,
         ))),
         opts,
     )
@@ -1268,20 +1266,15 @@ fn serve(args: &Args) -> Result<(), String> {
 /// The paths `serve` reads, resolved as the daemon resolves them.
 ///
 /// - Database: `--db`, else the configuration's `db`, else the default.
-/// - Block map: `--map`, else the configuration's `drop_map` **when that pin
-///   exists**, else the usual lookup. The daemon enforces through a configured
-///   shared map only if it is already pinned at startup and otherwise loads its
-///   own, so `serve` follows the same test.
+/// - Block map: `--map`, else the configuration's `drop_map` as a shared map,
+///   which each read tries first and passes over for the usual lookup when it
+///   is absent or unusable (`Blocklist::open_preferring`) — the same fallback
+///   the daemon applies to it at startup.
 ///
 /// The unit runs `serve` with no flags, so without this an installation whose
 /// daemon uses a configured `db` or `drop_map` would be served from different
 /// state, and unbans would land in the wrong map and the wrong record.
-fn serve_ctx(
-    args: &Args,
-    config_db: Option<PathBuf>,
-    config_map: Option<PathBuf>,
-    exists: impl Fn(&Path) -> bool,
-) -> Ctx {
+fn serve_ctx(args: &Args, config_db: Option<PathBuf>, config_map: Option<PathBuf>) -> Ctx {
     let mut ctx = args.ctx();
     if !args.db_given {
         if let Some(db) = config_db {
@@ -1289,7 +1282,7 @@ fn serve_ctx(
         }
     }
     if args.map.is_none() {
-        ctx.map = config_map.filter(|p| exists(p));
+        ctx.shared_map = config_map;
     }
     ctx
 }
@@ -2031,17 +2024,17 @@ mod tests {
         let configured = Some(PathBuf::from("/srv/tfps/state.db"));
         let a = args(&["serve"]).expect("parses");
         assert_eq!(
-            serve_ctx(&a, configured.clone(), None, |_| true).db,
+            serve_ctx(&a, configured.clone(), None).db,
             Path::new("/srv/tfps/state.db")
         );
         assert_eq!(
-            serve_ctx(&a, None, None, |_| true).db,
+            serve_ctx(&a, None, None).db,
             Path::new(tfps::store::DEFAULT_PATH),
             "no db in the file: the default"
         );
         let a = args(&["serve", "--db", "/tmp/x.db"]).expect("parses");
         assert_eq!(
-            serve_ctx(&a, configured, None, |_| true).db,
+            serve_ctx(&a, configured, None).db,
             Path::new("/tmp/x.db"),
             "the command line beats the file"
         );
@@ -2051,22 +2044,20 @@ mod tests {
     fn serve_reads_the_map_the_daemon_enforces_through() {
         let pin = || Some(PathBuf::from("/sys/fs/bpf/shared_drop"));
         let a = args(&["serve"]).expect("parses");
+        let c = serve_ctx(&a, None, pin());
         assert_eq!(
-            serve_ctx(&a, None, pin(), |_| true).map,
-            pin(),
-            "a configured drop_map that is pinned is the daemon's map"
+            (c.map, c.shared_map),
+            (None, pin()),
+            "drop_map is a shared map with the daemon's fallback, not an explicit pin"
         );
-        assert_eq!(
-            serve_ctx(&a, None, pin(), |_| false).map,
-            None,
-            "not pinned: the daemon loaded its own map, so the usual lookup"
-        );
-        assert_eq!(serve_ctx(&a, None, None, |_| true).map, None);
+        let c = serve_ctx(&a, None, None);
+        assert_eq!((c.map, c.shared_map), (None, None));
         let a = args(&["serve", "--map", "/sys/fs/bpf/other"]).expect("parses");
+        let c = serve_ctx(&a, None, pin());
         assert_eq!(
-            serve_ctx(&a, None, pin(), |_| true).map,
-            Some(PathBuf::from("/sys/fs/bpf/other")),
-            "the command line beats the file"
+            (c.map, c.shared_map),
+            (Some(PathBuf::from("/sys/fs/bpf/other")), None),
+            "the command line beats the file, and an explicit pin has no fallback"
         );
     }
 

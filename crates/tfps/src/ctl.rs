@@ -30,6 +30,10 @@ pub struct Ctx {
     pub db: PathBuf,
     /// An explicitly pinned block map (`--map`), or `None` for the usual lookup.
     pub map: Option<PathBuf>,
+    /// The daemon's configured shared map (`drop_map`), used when `map` is `None`:
+    /// tried first, and passed over for the usual lookup when it is absent or
+    /// unusable, exactly as the daemon does at startup.
+    pub shared_map: Option<PathBuf>,
     /// The configuration file (`--config`), read for `manual_log_dir`.
     pub config: PathBuf,
 }
@@ -39,8 +43,19 @@ impl Default for Ctx {
         Ctx {
             db: PathBuf::from(crate::store::DEFAULT_PATH),
             map: None,
+            shared_map: None,
             config: PathBuf::from(crate::config::DEFAULT_PATH),
         }
+    }
+}
+
+/// The block map `ctx` names: an explicit pin as given, else the configured
+/// shared map with the daemon's fallback, else the usual lookup.
+fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
+    match (&ctx.map, &ctx.shared_map) {
+        (Some(pin), _) => Blocklist::open(Some(pin)),
+        (None, Some(shared)) => Blocklist::open_preferring(shared),
+        (None, None) => Blocklist::open(None),
     }
 }
 
@@ -52,7 +67,7 @@ impl Default for Ctx {
 /// Never fails: a map that will not open reads as `"inactive"`, and an
 /// unreadable database nulls the learned totals, as `StatusDoc` describes.
 pub fn status_docs(ctx: &Ctx) -> StatusDoc {
-    let blocked = Blocklist::open(ctx.map.as_deref()).map(|b| (b.entries().len(), b.source));
+    let blocked = open_blocklist(ctx).map(|b| (b.entries().len(), b.source));
     let totals = Store::open_readonly(&ctx.db).and_then(|s| s.totals()).ok();
     status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"))
 }
@@ -80,7 +95,7 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
     // consumer reading `condemned_now: 0` off a box whose map could not
     // even be opened would conclude nothing is blocked, the exact wrong
     // reading this null is here to prevent.
-    let condemnation = Blocklist::open(ctx.map.as_deref())
+    let condemnation = open_blocklist(ctx)
         .ok()
         .map(|b| condemnation_counts(&b.entries(), &audit, &apiban));
     let now = now();
@@ -124,7 +139,7 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
 /// manual record leaves rows unattributed rather than failing the listing:
 /// the blocks themselves are still the kernel's to report.
 pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
-    let b = Blocklist::open(ctx.map.as_deref())?;
+    let b = open_blocklist(ctx)?;
     let entries = b.entries();
     // Both sets are loaded for the same reason the human path loads both: an
     // address on the feed alone is attributable, and reading only the audit
@@ -232,7 +247,7 @@ pub fn unban_docs(
         UnbanTarget::Addresses([]) => return Err("give at least one address, or --all".into()),
         UnbanTarget::Addresses(raw) => Some(parse_addresses(raw)?),
     };
-    let mut b = Blocklist::open(ctx.map.as_deref())?;
+    let mut b = open_blocklist(ctx)?;
     // A listing taken moments earlier is not a guarantee about now, so `--all`
     // reports what `remove` says was actually there, like the address form.
     let ips = ips.unwrap_or_else(|| b.entries().into_iter().map(|(ip, _)| ip).collect());
@@ -1893,6 +1908,7 @@ mod tests {
         Ctx {
             db: dir.join("absent.db"),
             map: Some(dir.join("absent-map")),
+            shared_map: None,
             config: dir.join("absent.json"),
         }
     }
@@ -2005,6 +2021,39 @@ mod tests {
         assert_eq!(d.blocks.last_hour.by_reason.get("scanner"), Some(&1));
         assert_eq!(d.learned.pairs, 0);
         let _ = std::fs::remove_file(&db);
+    }
+
+    /// A configured shared map that is present but unusable is passed over for
+    /// the daemon's own map, as the daemon itself does; an explicit pin is not.
+    /// No kernel here, so each case is told apart by which open failed.
+    #[test]
+    fn an_unusable_shared_map_falls_back_like_the_daemon_and_an_explicit_pin_does_not() {
+        let stale = scratch_db("stale-pin");
+        std::fs::write(&stale, b"not a BPF pin").expect("write");
+        let open = |map: Option<&PathBuf>, shared: Option<&PathBuf>| {
+            let ctx = Ctx {
+                map: map.cloned(),
+                shared_map: shared.cloned(),
+                ..nowhere()
+            };
+            open_blocklist(&ctx).err().expect("no kernel map here")
+        };
+        let own = open(None, None);
+        assert_eq!(
+            open(None, Some(&stale)),
+            own,
+            "an unusable shared pin falls back to the usual lookup"
+        );
+        assert_eq!(
+            open(None, Some(&stale.with_extension("absent"))),
+            own,
+            "so does an absent one"
+        );
+        assert!(
+            open(Some(&stale), None).contains(&stale.display().to_string()),
+            "an explicit pin is opened as given, with no fallback"
+        );
+        let _ = std::fs::remove_file(&stale);
     }
 
     #[test]
