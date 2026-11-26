@@ -200,6 +200,11 @@ pub enum UnbanTarget<'a> {
 /// whatever was removed is recorded even when a later kernel write fails, so
 /// the record never misses an unban that took effect.
 ///
+/// `source` and `reason` are held to the same rules as `--source` and
+/// `--reason` (`manual_log::check_source` / `check_reason`), here and not only
+/// in the CLI's parser, because they are written to the manual-action record
+/// and a caller other than the command line reaches this function directly.
+///
 /// `Err` means nothing was touched: bad input, or a map that will not open.
 /// A kernel failure part-way through is not an `Err`: it is
 /// `UnbanOutcome::failed`, beside the documents for the addresses handled
@@ -210,6 +215,12 @@ pub fn unban_docs(
     source: Option<&str>,
     reason: Option<&str>,
 ) -> Result<UnbanOutcome, String> {
+    if let Some(s) = source {
+        crate::manual_log::check_source(s)?;
+    }
+    if let Some(r) = reason {
+        crate::manual_log::check_reason(r)?;
+    }
     let ips: Option<Vec<Ipv4Addr>> = match target {
         UnbanTarget::All => None,
         UnbanTarget::Addresses([]) => return Err("give at least one address, or --all".into()),
@@ -2035,6 +2046,26 @@ mod tests {
         let e =
             unban_docs(&nowhere(), UnbanTarget::Addresses(&raw), None, None).expect_err("refused");
         assert!(e.starts_with("203.0.113.x: "), "{e}");
+    }
+
+    /// The record's rules hold for every caller, not just the CLI's parser:
+    /// a bad `source` or `reason` is refused before the map is touched.
+    /// `nowhere()`'s map does not exist, so reaching it would fail differently.
+    #[test]
+    fn unban_docs_refuses_a_bad_source_or_reason_before_touching_the_map() {
+        let raw = ["203.0.113.1".to_string()];
+        let unban = |source, reason| {
+            unban_docs(&nowhere(), UnbanTarget::Addresses(&raw), source, reason)
+                .expect_err("refused")
+        };
+        assert!(unban(Some("has space"), None).starts_with("--source "));
+        assert!(unban(Some(""), None).starts_with("--source "));
+        assert!(unban(None, Some("line\nbreak")).starts_with("--reason "));
+        assert!(unban(None, Some("")).starts_with("--reason "));
+        assert!(
+            !unban(Some("panel"), Some("ok")).starts_with("--"),
+            "valid values pass the check and reach the map"
+        );
     }
 
     #[test]
