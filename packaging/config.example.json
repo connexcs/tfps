@@ -11,6 +11,8 @@
   "http": {
     "enabled": false,
     "listen": "127.0.0.1:9060",
-    "allow_unban": false
+    "allow_unban": false,
+    "hosts": [],
+    "allow_remote": false
   }
 }

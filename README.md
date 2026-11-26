@@ -541,9 +541,18 @@ enforcement, and a bug in it cannot take the packet path down with it.
 "http": {
   "enabled": true,
   "listen": "127.0.0.1:9060",
-  "allow_unban": false
+  "allow_unban": false,
+  "hosts": [],
+  "allow_remote": false,
+  "token_file": "/etc/tfps/api-token"
 }
 ```
+
+`hosts` adds `Host` names the API answers to (the listen address, and `localhost` on
+loopback, need no entry). `allow_remote` must be `true` to listen on anything but loopback.
+`token_file` is optional: when set, every route but `/v1/health` needs
+`Authorization: Bearer <token>`, and the file must be readable by its owner only
+(`install -m 600 /dev/null /etc/tfps/api-token`, then write a long random token into it).
 
 then start the unit the installer put in place but did not enable:
 
@@ -571,9 +580,11 @@ services, so the API can be stopped or upgraded without touching enforcement.
 
 Every document is exactly what the matching `tfps_ctl … --json` prints, and keeps its
 null-not-zero rule: an unreadable database is `null`, never `0`. Errors are
-`{"error":"…"}` with 400 (bad input), 403 (unban off, or a request from a web page), 404,
-405, 411, 413 (body over 64 KiB), 415 (not `application/json`), or 503 (the block map or
-database cannot be read). `/v1/unban` answers with one `unban --json` document per address:
+`{"error":"…"}` with 400 (bad input), 401 (token missing or wrong), 403 (unban off, a
+request from a web page, or a `Host` not on the list), 404, 405, 408 (request not received
+within 10 s), 411, 413 (body over 64 KiB), 415 (not `application/json`), or 503 (tfps not
+running, enforcement inactive, the block map or database unreadable, or another full listing
+in progress). `/v1/unban` answers with one `unban --json` document per address:
 **200** when every address was lifted, **422** when any was not blocked, **500** with
 `{"error":…,"results":[…]}` if the kernel failed part-way. At most 256 addresses per
 request; `source` defaults to `http`, and every unban lands in the same
@@ -593,26 +604,41 @@ the audit log, and a value that cannot be read is left out, never reported as 0.
 `/v1/blocks` and `/v1/stats` start from the block map too, and ask the audit log and the
 APIBAN feed only about the addresses in it.
 
+**Which block map.** The daemon chooses its map once, at startup, and publishes the choice
+in `/run/tfps/state.json`: its own map by kernel id, or the shared map it uses by pin path.
+The API reads and edits exactly that map, never one it found itself, so it cannot drift to a
+map the daemon is not enforcing through. When tfps is not running (systemd removes the file)
+or enforcement is inactive, the block routes answer 503 and say so. `/v1/status` takes the
+XDP attach mode and interface from the same file.
+
 ### Security model — read this before exposing it
 
-- **No authentication, no TLS.** Anyone who can reach the listen address can read every
-  block, and lift them when `allow_unban` is on. On the default loopback address that
-  means **every local user and process on the host**.
-- **Loopback by default.** Listening on any other address works, and logs a `WARNING` at
-  startup: the reverse proxy may well be on another host.
+- **Loopback by default.** Listening on any other address needs `"allow_remote": true`;
+  without it `serve` refuses to start. With it, `serve` still logs a `WARNING` at startup.
+- **`Host` is checked.** A request must name the listen address, `localhost` (on loopback)
+  or a name in `hosts`; anything else gets 403. That stops a web page that rebinds its own
+  name to this address (DNS rebinding) from reading the API.
+- **Web pages are refused.** Any request with an `Origin` header gets 403, and the unban
+  route takes only `POST` with `Content-Type: application/json`.
+- **Optional bearer token** for machine-to-machine access (`token_file`). Without one,
+  anyone who can reach the listen address can read every block, and lift them when
+  `allow_unban` is on. On loopback that means **every local user and process on the host**.
 - **Unbanning is a second switch, off by default.** Without `allow_unban`, `/v1/unban`
   answers 403 before anything touches the block map. There is no ban over HTTP.
-- **Web pages are refused.** Any request with an `Origin` header gets 403, and the unban
-  route takes only `POST` with `Content-Type: application/json`, so a page open in a local
-  browser cannot lift a block. The `Host` header is not checked, so a DNS-rebinding page
-  *can* read the GET endpoints — the same reach every local process already has.
-- **Bounded.** Four worker threads, a short queue (a full one answers 503), 5-second read
-  and write timeouts, an 8 KiB request head, a 64 KiB body, one request per connection.
+- **No TLS.** Put a reverse proxy (Caddy, nginx) in front for anything beyond the host.
+- **Strict, bounded HTTP.** Requests are parsed by `httparse`; line endings other than
+  CRLF, any `Transfer-Encoding`, and a repeated `Content-Length` or `Host` are refused, so a
+  proxy and this server cannot read one request two ways. Four worker threads and a short
+  queue (a full one answers 503); reading a request and writing its response each have a
+  10-second deadline, so a slow client cannot hold a worker; an 8 KiB request head, a 64 KiB
+  body, one request per connection. Full `/v1/blocks` listings are streamed and take turns,
+  which keeps a full map (65,536 entries) at about 41 MB peak.
 - **Reduced privileges.** `tfps-api.service` keeps only `CAP_BPF` and `CAP_SYS_ADMIN`
-  (opening the map), not the daemon's capture and attach capabilities.
+  (opening the daemon's map by id), not the daemon's capture and attach capabilities, with
+  further systemd hardening on top.
 
-For anything beyond the host, put a reverse proxy with authentication and TLS in front of
-it. For example, nginx with basic auth:
+Behind nginx, the default `proxy_pass` sends `Host: 127.0.0.1:9060`, which is accepted
+as is:
 
 ```nginx
 location /tfps/ {
@@ -620,6 +646,17 @@ location /tfps/ {
     auth_basic_user_file /etc/nginx/tfps.htpasswd;
     proxy_pass           http://127.0.0.1:9060/;
 }
+```
+
+Prometheus with a token:
+
+```yaml
+scrape_configs:
+  - job_name: tfps
+    authorization:
+      credentials_file: /etc/prometheus/tfps-token
+    static_configs:
+      - targets: ["127.0.0.1:9060"]
 ```
 
 Block, unblock and expiry webhooks are planned (issue #1), and will come from the same process.
@@ -688,7 +725,7 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 | **a broad international profile** | anomaly saturates by construction — a peer already calling 200 countries has no burst left |
 | **the first 30 days** | the behavioural layer's learning window, by design and announced |
 | **a low-and-slow mimic** | the residual gap no on-wire method closes — hence opt-in, TTL'd, unbannable |
-| **authentication or TLS on the JSON API** | it listens on loopback; anything wider is a reverse proxy's job — see "JSON API" |
+| **TLS on the JSON API** | it listens on loopback with an optional bearer token; TLS for anything wider is a reverse proxy's job — see "JSON API" |
 | **forged SIP `603`** | source-level XDP blocking is available with `--enforce-behavioural`; the SIP-level reject is still missing |
 
 ---

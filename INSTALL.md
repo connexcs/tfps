@@ -87,6 +87,9 @@ installed as `tfps-api.service` but not enabled. Set `"http": {"enabled": true}`
 configuration, then `systemctl enable --now tfps-api`; it listens on `127.0.0.1:9060`. It
 reads the `http` section only when it starts, so after editing that section (including to
 turn the API off) run `systemctl restart tfps-api`: restarting `tfps` does not restart it.
+It reads blocks from the map the running daemon publishes in `/run/tfps/state.json`, so
+after upgrading from a version without that file, restart `tfps` too. For machine clients,
+set `token_file` (owner-readable only); to listen beyond loopback, set `allow_remote`.
 Read the README's "JSON API" section, its security model in particular, before exposing it.
 
 ## Pinning a version

@@ -20,7 +20,8 @@ Restart=on-failure
 RestartSec=5
 
 # Shares the daemon's state directory: it reads the database and, with
-# allow_unban, appends to the manual-action record beside it.
+# allow_unban, appends to the manual-action record beside it. It reads which
+# block map to use from /run/tfps/state.json, which tfps.service publishes.
 StateDirectory=tfps
 StateDirectoryMode=0700
 UMask=0077
@@ -37,6 +38,24 @@ ProtectSystem=full
 ReadOnlyPaths=/etc/tfps
 ProtectHome=yes
 PrivateTmp=yes
+
+# Further hardening. None of these is needed to open a BPF map, answer HTTP on
+# AF_INET or log to the journal over AF_UNIX, but they have not yet been run on
+# every supported kernel and systemd: if `systemctl status tfps-api` shows it
+# failing to start, or /v1/blocks answers 503 while `tfps_ctl banned` works,
+# remove them one at a time to find the one that matters there.
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
 # Measured with a simulated full block map (65,536 entries, `cargo run --release
 # -p tfps --example api_memory`): about 41 MB peak, with /v1/blocks listings taking
 # turns (one at a time) and streamed. One glibc malloc arena keeps it there; with
