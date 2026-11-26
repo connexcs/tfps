@@ -99,6 +99,9 @@ struct Args {
     listen: Option<std::net::SocketAddrV4>,
     /// `serve --allow-unban`: turns on `http.allow_unban`.
     allow_unban: bool,
+    /// Whether `--db` was on the command line, so `serve` can tell an explicit
+    /// path from the default and let the configuration's `db` fill the latter.
+    db_given: bool,
 }
 
 impl Args {
@@ -133,6 +136,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         reason: None,
         listen: None,
         allow_unban: false,
+        db_given: false,
     };
     let mut it = argv.iter();
     let value = |name: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -142,7 +146,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--db" => a.db = PathBuf::from(value("--db", &mut it)?),
+            "--db" => {
+                a.db = PathBuf::from(value("--db", &mut it)?);
+                a.db_given = true;
+            }
             "--map" => a.map = Some(PathBuf::from(value("--map", &mut it)?)),
             "--config" => a.config = PathBuf::from(value("--config", &mut it)?),
             "--peer" => a.peer = Some(value("--peer", &mut it)?),
@@ -1223,9 +1230,9 @@ fn forget(args: &Args) -> Result<(), String> {
 /// Off unless the configuration enables it, and then it says so and exits 0, so
 /// the unit can be installed and left alone without systemd restarting it.
 fn serve(args: &Args) -> Result<(), String> {
-    let http = match tfps::config::load(&args.config) {
-        tfps::config::Loaded::File(c, _) => c.http.unwrap_or_default(),
-        tfps::config::Loaded::Absent => tfps::config::HttpConfig::default(),
+    let (http, config_db, config_map) = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => (c.http.unwrap_or_default(), c.db, c.drop_map),
+        tfps::config::Loaded::Absent => (tfps::config::HttpConfig::default(), None, None),
         // A broken file must not quietly turn into "the API is off".
         tfps::config::Loaded::Broken(e) => return Err(e),
     };
@@ -1247,10 +1254,44 @@ fn serve(args: &Args) -> Result<(), String> {
     );
     tfps::api::serve(
         listener,
-        std::sync::Arc::new(tfps::api::CtlBackend(args.ctx())),
+        std::sync::Arc::new(tfps::api::CtlBackend(serve_ctx(
+            args,
+            config_db,
+            config_map,
+            Path::exists,
+        ))),
         opts,
     )
     .map_err(|e| format!("serving: {e}"))
+}
+
+/// The paths `serve` reads, resolved as the daemon resolves them.
+///
+/// - Database: `--db`, else the configuration's `db`, else the default.
+/// - Block map: `--map`, else the configuration's `drop_map` **when that pin
+///   exists**, else the usual lookup. The daemon enforces through a configured
+///   shared map only if it is already pinned at startup and otherwise loads its
+///   own, so `serve` follows the same test.
+///
+/// The unit runs `serve` with no flags, so without this an installation whose
+/// daemon uses a configured `db` or `drop_map` would be served from different
+/// state, and unbans would land in the wrong map and the wrong record.
+fn serve_ctx(
+    args: &Args,
+    config_db: Option<PathBuf>,
+    config_map: Option<PathBuf>,
+    exists: impl Fn(&Path) -> bool,
+) -> Ctx {
+    let mut ctx = args.ctx();
+    if !args.db_given {
+        if let Some(db) = config_db {
+            ctx.db = db;
+        }
+    }
+    if args.map.is_none() {
+        ctx.map = config_map.filter(|p| exists(p));
+    }
+    ctx
 }
 
 /// The listen address and options `serve` runs with, or `None` when the API is
@@ -1982,6 +2023,50 @@ mod tests {
                 .expect("on")
                 .1
                 .allow_unban
+        );
+    }
+
+    #[test]
+    fn serve_reads_the_database_the_daemon_writes() {
+        let configured = Some(PathBuf::from("/srv/tfps/state.db"));
+        let a = args(&["serve"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, configured.clone(), None, |_| true).db,
+            Path::new("/srv/tfps/state.db")
+        );
+        assert_eq!(
+            serve_ctx(&a, None, None, |_| true).db,
+            Path::new(tfps::store::DEFAULT_PATH),
+            "no db in the file: the default"
+        );
+        let a = args(&["serve", "--db", "/tmp/x.db"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, configured, None, |_| true).db,
+            Path::new("/tmp/x.db"),
+            "the command line beats the file"
+        );
+    }
+
+    #[test]
+    fn serve_reads_the_map_the_daemon_enforces_through() {
+        let pin = || Some(PathBuf::from("/sys/fs/bpf/shared_drop"));
+        let a = args(&["serve"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, None, pin(), |_| true).map,
+            pin(),
+            "a configured drop_map that is pinned is the daemon's map"
+        );
+        assert_eq!(
+            serve_ctx(&a, None, pin(), |_| false).map,
+            None,
+            "not pinned: the daemon loaded its own map, so the usual lookup"
+        );
+        assert_eq!(serve_ctx(&a, None, None, |_| true).map, None);
+        let a = args(&["serve", "--map", "/sys/fs/bpf/other"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, None, pin(), |_| true).map,
+            Some(PathBuf::from("/sys/fs/bpf/other")),
+            "the command line beats the file"
         );
     }
 
