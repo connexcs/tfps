@@ -73,6 +73,19 @@ pub fn audit_maps(
     (audit, newest)
 }
 
+/// The XDP program's `(seen, dropped, expired)`, `None` when they cannot all be
+/// read. With a state file, exactly the counters the running daemon published
+/// (none when it enforces through a shared map, whose counters are not ours);
+/// otherwise the command line's lookup by name.
+pub fn kernel_counters(ctx: &Ctx) -> Option<(u64, u64, u64)> {
+    let c = match &ctx.state {
+        Some(path) => crate::xdp::counters_by_id(crate::state::read_live(path).ok()?.counters?),
+        None => crate::xdp::live_counters(),
+    }
+    .ok()?;
+    Some((c.seen, c.dropped, c.expired))
+}
+
 /// The block map `ctx` names: an explicit pin as given, else the map the
 /// daemon's state file names, else the usual lookup.
 fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
@@ -98,7 +111,7 @@ pub fn status_docs(ctx: &Ctx) -> StatusDoc {
     if let Some(state) = ctx
         .state
         .as_deref()
-        .and_then(|p| crate::state::read(p).ok())
+        .and_then(|p| crate::state::read_live(p).ok())
     {
         doc.mode = state.mode;
         doc.interface = state.interface;
@@ -113,9 +126,7 @@ pub fn status_docs(ctx: &Ctx) -> StatusDoc {
 /// The kernel counters and the condemnation summary are `null` rather than an
 /// error when their maps cannot be read, as `StatsDoc` describes.
 pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
-    let kernel = crate::xdp::live_counters()
-        .ok()
-        .map(|c| (c.seen, c.dropped, c.expired));
+    let kernel = kernel_counters(ctx);
     let s = Store::open_readonly(&ctx.db)?;
     // `null`, not `(0, 0, 0)`, when the blocklist map cannot be opened —
     // the same reason `kernel` above is `None` rather than zeroed: a
@@ -1964,13 +1975,16 @@ mod tests {
             open(None).contains("not running"),
             "no file: the daemon is not running"
         );
+        let this = crate::state::this_process();
         let write = |map| {
             crate::state::write(
                 &state,
                 &crate::state::State {
-                    pid: 1,
+                    pid: this.0,
+                    pid_start: this.1,
                     started_at: 1,
                     map,
+                    counters: None,
                     mode: None,
                     interface: None,
                 },
@@ -1986,10 +2000,14 @@ mod tests {
             open(None)
         );
         let pin = dir.join("shared-pin");
-        write(crate::state::ActiveMap::Shared { pin: pin.clone() });
+        write(crate::state::ActiveMap::Shared {
+            pin: pin.clone(),
+            id: 4_000_000,
+        });
+        let e = open(None);
         assert!(
-            open(None).contains(&pin.display().to_string()),
-            "that pin, no fallback"
+            e.contains("map id 4000000") && e.contains(&pin.display().to_string()),
+            "the published id, not the pin path: {e}"
         );
         let explicit = dir.join("explicit-pin");
         assert!(
@@ -2007,8 +2025,10 @@ mod tests {
         crate::state::write(
             &state,
             &crate::state::State {
-                pid: 1,
+                pid: crate::state::this_process().0,
+                pid_start: crate::state::this_process().1,
                 started_at: 1,
+                counters: None,
                 map: crate::state::ActiveMap::Inactive {
                     reason: "test".into(),
                 },

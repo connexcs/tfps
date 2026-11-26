@@ -58,8 +58,9 @@ pub struct Enforcer {
     /// How our own program is attached (`"native (DRV)"`, `"generic (SKB)"`) and
     /// where; `None` when enforcing through a shared map.
     pub attach: Option<(String, String)>,
-    /// The pin path, when enforcing through a shared map.
-    shared_pin: Option<std::path::PathBuf>,
+    /// The pin path and the kernel id of the map opened from it, when enforcing
+    /// through a shared map.
+    shared: Option<(std::path::PathBuf, u32)>,
 }
 
 /// Counters read from the kernel.
@@ -105,12 +106,17 @@ impl Enforcer {
         let map = Self::open_pinned(path, true)
             .or_else(|_| Self::open_pinned(path, false))
             .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
+        // The id of the map just opened, read from the same pin straight after,
+        // so the state file can name this map even if the pin is replaced later.
+        let id = aya::maps::MapInfo::from_pin(path)
+            .map_err(|e| format!("reading the id of {}: {e}", path.display()))?
+            .id();
         Ok(Self {
             mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
             backend: Backend::Shared { map },
             attach: None,
-            shared_pin: Some(path.to_path_buf()),
+            shared: Some((path.to_path_buf(), id)),
         })
     }
 
@@ -169,7 +175,7 @@ impl Enforcer {
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
             attach: Some((mode.to_string(), iface.to_string())),
-            shared_pin: None,
+            shared: None,
         };
         me.publish_ports(ports)?;
         Ok(me)
@@ -178,11 +184,12 @@ impl Enforcer {
     /// The map this enforcer writes to, as the daemon publishes it in its state
     /// file: the pin path of a shared map, or the kernel id of our own `blocked`.
     pub fn active_map(&self) -> Result<crate::state::ActiveMap, String> {
-        match (&self.backend, &self.shared_pin) {
-            (Backend::Shared { .. }, Some(pin)) => {
-                Ok(crate::state::ActiveMap::Shared { pin: pin.clone() })
-            }
-            (Backend::Shared { .. }, None) => Err("a shared map without its pin path".into()),
+        match (&self.backend, &self.shared) {
+            (Backend::Shared { .. }, Some((pin, id))) => Ok(crate::state::ActiveMap::Shared {
+                pin: pin.clone(),
+                id: *id,
+            }),
+            (Backend::Shared { .. }, None) => Err("a shared map without its id".into()),
             (Backend::Own { bpf }, _) => {
                 let data = match bpf.map("blocked").ok_or("map `blocked` is missing")? {
                     Map::LruHashMap(d) | Map::HashMap(d) => d,
@@ -193,6 +200,18 @@ impl Enforcer {
                     .map_err(|e| format!("reading map `blocked`'s id: {e}"))?;
                 Ok(crate::state::ActiveMap::Own { id: info.id() })
             }
+        }
+    }
+
+    /// The kernel id of our own program's `counters` map, for the state file;
+    /// `None` for a shared map, whose counters belong to its owner.
+    pub fn counters_id(&self) -> Option<u32> {
+        let Backend::Own { bpf } = &self.backend else {
+            return None;
+        };
+        match bpf.map("counters")? {
+            Map::Array(d) => d.info().ok().map(|i| i.id()),
+            _ => None,
         }
     }
 
@@ -350,12 +369,16 @@ impl Blocklist {
     /// not be read or edited in its place. No file means the daemon is not
     /// running; enforcement it reports as inactive means there is no map.
     pub fn open_from_state(path: &Path) -> Result<Self, String> {
-        match crate::state::read(path)?.map {
-            crate::state::ActiveMap::Shared { pin } => Ok(Self {
-                map: Self::open_pin(&pin)?,
-                big_endian: true,
-                source: format!("shared map {}", pin.display()),
-            }),
+        match crate::state::read_live(path)?.map {
+            crate::state::ActiveMap::Shared { pin, id } => {
+                let map = open_hash_by_id(id)
+                    .map_err(|e| format!("the shared map ({}): {e}", pin.display()))?;
+                Ok(Self {
+                    map,
+                    big_endian: true,
+                    source: format!("shared map id {id} ({})", pin.display()),
+                })
+            }
             crate::state::ActiveMap::Own { id } => Self::open_by_id(id),
             crate::state::ActiveMap::Inactive { reason } => {
                 Err(format!("enforcement is inactive: {reason}"))
@@ -379,10 +402,9 @@ impl Blocklist {
                 "map id {id} is {name:?}, not tfps's `blocked`: the state file is stale"
             ));
         }
-        let map = BpfHashMap::try_from(Map::LruHashMap(data))
-            .map_err(|e| format!("map id {id} is not a hash<u32,u64>: {e}"))?;
+        drop(data);
         Ok(Self {
-            map,
+            map: open_hash_by_id(id)?,
             big_endian: false,
             source: format!("own map id {id}"),
         })
@@ -511,14 +533,45 @@ pub fn live_counters() -> Result<Counters, String> {
         .find(|i| i.name_as_str() == Some("counters"))
         .map(|i| i.id())
         .ok_or("no loaded eBPF map called `counters` — is tfps running with enforcement?")?;
-    let data = MapData::from_id(id).map_err(|e| format!("opening counters map: {e}"))?;
+    counters_by_id(id)
+}
+
+/// The XDP counters in the map with kernel id `id`, as the daemon publishes it
+/// in its state file: exactly that map, never the first one with the name.
+pub fn counters_by_id(id: u32) -> Result<Counters, String> {
+    let data = MapData::from_id(id).map_err(|e| format!("opening counters map id {id}: {e}"))?;
+    let name = data
+        .info()
+        .ok()
+        .and_then(|i| i.name_as_str().map(str::to_string));
+    if name.as_deref() != Some("counters") {
+        return Err(format!("map id {id} is {name:?}, not tfps's `counters`"));
+    }
     let arr = Array::<_, u64>::try_from(Map::Array(data))
         .map_err(|e| format!("counters is not an array<u64>: {e}"))?;
+    read_counters(|i| arr.get(&i, 0))
+}
+
+/// The three counters, or an error if any of them cannot be read: a counter
+/// that could not be read is not reported as zero.
+fn read_counters(get: impl Fn(u32) -> Result<u64, MapError>) -> Result<Counters, String> {
+    let read = |i: u32, name: &str| get(i).map_err(|e| format!("reading counter {name}: {e}"));
     Ok(Counters {
-        dropped: arr.get(&C_DROPPED, 0).unwrap_or(0),
-        seen: arr.get(&C_SEEN, 0).unwrap_or(0),
-        expired: arr.get(&C_EXPIRED, 0).unwrap_or(0),
+        dropped: read(C_DROPPED, "dropped")?,
+        seen: read(C_SEEN, "seen")?,
+        expired: read(C_EXPIRED, "expired")?,
     })
+}
+
+/// A `hash<u32,u64>` block map by kernel id, LRU or plain, as `open_pin`
+/// accepts either from a pin.
+fn open_hash_by_id(id: u32) -> Result<BpfHashMap<MapData, u32, u64>, String> {
+    let open = || MapData::from_id(id).map_err(|e| format!("opening map id {id}: {e}"));
+    if let Ok(map) = BpfHashMap::try_from(Map::LruHashMap(open()?)) {
+        return Ok(map);
+    }
+    BpfHashMap::try_from(Map::HashMap(open()?))
+        .map_err(|e| format!("map id {id} is not a hash<u32,u64>: {e}"))
 }
 
 /// Every IPv4 address configured on this host.
@@ -637,6 +690,28 @@ mod tests {
             addr,
         );
         assert!(err.is_err(), "a listing failure is reported");
+    }
+
+    #[test]
+    fn a_counter_that_cannot_be_read_is_an_error_not_zero() {
+        let all = read_counters(|i| Ok(u64::from(i) + 10)).expect("readable");
+        assert_eq!(
+            (all.dropped, all.seen, all.expired),
+            (
+                u64::from(C_DROPPED) + 10,
+                u64::from(C_SEEN) + 10,
+                u64::from(C_EXPIRED) + 10
+            )
+        );
+        let e = read_counters(|i| {
+            if i == C_SEEN {
+                Err(MapError::KeyNotFound)
+            } else {
+                Ok(1)
+            }
+        })
+        .expect_err("one unreadable counter");
+        assert!(e.contains("seen"), "{e}");
     }
 
     #[test]

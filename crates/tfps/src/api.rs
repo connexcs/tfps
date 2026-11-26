@@ -112,9 +112,7 @@ impl Backend for CtlBackend {
         crate::ctl::log_docs(&self.0, limit, ip)
     }
     fn kernel_counters(&self) -> Option<(u64, u64, u64)> {
-        crate::xdp::live_counters()
-            .ok()
-            .map(|c| (c.seen, c.dropped, c.expired))
+        crate::ctl::kernel_counters(&self.0)
     }
     fn map_counts(&self) -> Result<(usize, usize), String> {
         crate::ctl::map_counts(&self.0)

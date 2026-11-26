@@ -605,11 +605,15 @@ the audit log, and a value that cannot be read is left out, never reported as 0.
 APIBAN feed only about the addresses in it.
 
 **Which block map.** The daemon chooses its map once, at startup, and publishes the choice
-in `/run/tfps/state.json`: its own map by kernel id, or the shared map it uses by pin path.
+in `/run/tfps/state.json`: the kernel id of its own map, or of the shared map it opened
+(with the pin path, for the record; a pin replaced later does not change which map is used).
 The API reads and edits exactly that map, never one it found itself, so it cannot drift to a
-map the daemon is not enforcing through. When tfps is not running (systemd removes the file)
-or enforcement is inactive, the block routes answer 503 and say so. `/v1/status` takes the
-XDP attach mode and interface from the same file.
+map the daemon is not enforcing through. The file also names the daemon's process (pid and
+start time): when tfps is not running (systemd removes the file, and a file left by a crash
+names a process that is gone) or enforcement is inactive, the block routes answer 503 and say
+so. `/v1/status` takes the XDP attach mode and interface from the same file, and the
+`tfps_xdp_*` metrics read the counters map it names; with a shared map those counters are its
+owner's, and they are left out.
 
 ### Security model — read this before exposing it
 

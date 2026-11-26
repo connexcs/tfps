@@ -1320,8 +1320,11 @@ fn publish_state(enforcer: Option<&xdp::Enforcer>, not_enforcing: &str) {
         Some((mode, iface)) => (Some(mode), Some(iface)),
         None => (None, None),
     };
+    let (pid, pid_start) = tfps::state::this_process();
     let state = tfps::state::State {
-        pid: std::process::id(),
+        pid,
+        pid_start,
+        counters: enforcer.and_then(|e| e.counters_id()),
         started_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
