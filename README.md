@@ -553,7 +553,10 @@ curl -s 127.0.0.1:9060/v1/blocks
 ```
 
 `tfps_ctl serve --listen ADDR --allow-unban` override the file (command line beats file).
-Neither flag turns the API on by itself: `enabled` is the one switch.
+Neither flag turns the API on by itself: `enabled` is the one switch. The `http` section is
+read when the API starts, so **after editing it, `systemctl restart tfps-api`** — including
+to turn the API off. Restarting `tfps` does not restart the API: the two are separate
+services, so the API can be stopped or upgraded without touching enforcement.
 
 | method | path | answers |
 |---|---|---|
@@ -576,12 +579,16 @@ database cannot be read). `/v1/unban` answers with one `unban --json` document p
 request; `source` defaults to `http`, and every unban lands in the same
 `manual_actions-YYYYMM.jsonl` record as one from the command line.
 
-`/metrics` reflects the kernel and nothing else: the XDP counters (`tfps_xdp_seen_total`,
-`tfps_xdp_dropped_total`, `tfps_xdp_expired_total`), the number of sources in the block map
-now (`tfps_blocked_sources`) and how many of them never expire
-(`tfps_blocked_sources_permanent`), and `tfps_build_info`. It reads no database and no
-address leaves the map, so a scrape costs the same however long the audit log grows. A value
-that cannot be read is left out, never reported as 0.
+`/metrics` reports counts and never an address. From the kernel: the XDP counters
+(`tfps_xdp_seen_total`, `tfps_xdp_dropped_total`, `tfps_xdp_expired_total`), the number of
+sources in the block map now (`tfps_blocked_sources`) and how many never expire
+(`tfps_blocked_sources_permanent`). From the daemon's database, through counting queries:
+blocks logged by reason over the last hour, day and week
+(`tfps_blocks_logged{window="1h|24h|7d",reason=…}`), the APIBAN feed size
+(`tfps_apiban_feed_entries`), the traffic counters as of the last checkpoint
+(`tfps_traffic_total{counter=…}`) with `tfps_checkpoint_timestamp_seconds` so staleness is
+visible, and the learned totals. Plus `tfps_build_info`. A scrape's cost does not grow with
+the audit log, and a value that cannot be read is left out, never reported as 0.
 
 `/v1/blocks` and `/v1/stats` start from the block map too, and ask the audit log and the
 APIBAN feed only about the addresses in it.

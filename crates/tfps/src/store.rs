@@ -81,6 +81,13 @@ pub struct BlockSummary {
     pub first_seen: u32,
 }
 
+/// A set of addresses as a JSON array, for `json_each` to turn back into rows
+/// inside a query. Addresses are plain dotted quads, but serde does the quoting
+/// anyway rather than trusting that.
+fn addresses_json(among: &std::collections::HashSet<String>) -> String {
+    serde_json::to_string(among).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// How an operator narrows a source search.
 pub struct SourceFilter<'a> {
     pub peer: Option<&'a str>,
@@ -569,10 +576,11 @@ impl Store {
 
     /// What the audit log says about each of `among` that it mentions.
     ///
-    /// SQLite reduces the log to one row per address (newest row's reason and
-    /// detail, newest and oldest time) and only the addresses in `among` are kept,
-    /// so memory follows the size of `among` (the kernel block map), not the
-    /// length of the log. Two rows with the same time are ordered by insertion:
+    /// `among` is handed to SQLite, which keeps only those addresses' rows before
+    /// reducing them to one row per address (newest row's reason and detail,
+    /// newest and oldest time). Only the matching rows are sorted, and only one
+    /// row per matching address comes back, so the cost follows the size of
+    /// `among` (the kernel block map), not the length of the log. Two rows with the same time are ordered by insertion:
     /// the later-written one is the newer.
     pub fn block_summaries(
         &self,
@@ -590,11 +598,12 @@ impl Store {
                             MIN(ts) OVER (PARTITION BY ip) AS first_seen,
                             ROW_NUMBER() OVER (PARTITION BY ip ORDER BY ts DESC, rowid DESC) AS rn
                      FROM block_log
+                     WHERE ip IN (SELECT value FROM json_each(?1))
                  ) WHERE rn = 1",
             )
             .map_err(|e| format!("reading block_log: {e}"))?;
         let rows = st
-            .query_map([], |r| {
+            .query_map([addresses_json(among)], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     BlockSummary {
@@ -615,8 +624,8 @@ impl Store {
         Ok(out)
     }
 
-    /// Which of `among` the audit log mentions at all. Streamed like
-    /// `block_summaries`, without sorting each address's rows.
+    /// Which of `among` the audit log mentions at all, filtered in SQLite the way
+    /// `block_summaries` is.
     pub fn logged_among(
         &self,
         among: &std::collections::HashSet<String>,
@@ -627,10 +636,13 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare("SELECT DISTINCT ip FROM block_log")
+            .prepare(
+                "SELECT DISTINCT ip FROM block_log
+                 WHERE ip IN (SELECT value FROM json_each(?1))",
+            )
             .map_err(|e| format!("reading block_log: {e}"))?;
         let rows = st
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([addresses_json(among)], |r| r.get::<_, String>(0))
             .map_err(|e| format!("iterating block_log: {e}"))?;
         for row in rows {
             let ip = row.map_err(|e| format!("reading block_log: {e}"))?;

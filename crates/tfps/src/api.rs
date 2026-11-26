@@ -33,7 +33,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::ctl::{
-    ActionDoc, BannedDoc, Ctx, LogDoc, StatsDoc, StatusDoc, UnbanOutcome, UnbanTarget,
+    ActionDoc, BannedDoc, Ctx, DbCounts, LogDoc, StatsDoc, StatusDoc, UnbanOutcome, UnbanTarget,
 };
 
 /// Worker threads. Each handles one connection at a time, start to finish.
@@ -63,11 +63,15 @@ pub trait Backend: Send + Sync {
     fn status(&self) -> StatusDoc;
     fn stats(&self) -> Result<StatsDoc, String>;
     fn banned(&self) -> Result<Vec<BannedDoc>, String>;
+    /// One address's document, `None` when it is not blocked.
+    fn banned_one(&self, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String>;
     fn log(&self, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>, String>;
     /// The XDP program's `(seen, dropped, expired)` counters, `None` when unreadable.
     fn kernel_counters(&self) -> Option<(u64, u64, u64)>;
     /// `(blocked now, of which permanent)`, counted from the block map.
     fn map_counts(&self) -> Result<(usize, usize), String>;
+    /// The counts `/metrics` reads from SQLite. No addresses.
+    fn db_counts(&self) -> Result<DbCounts, String>;
     /// Lift these already-validated addresses. `Err` means nothing was touched.
     fn unban(
         &self,
@@ -90,6 +94,9 @@ impl Backend for CtlBackend {
     fn banned(&self) -> Result<Vec<BannedDoc>, String> {
         crate::ctl::banned_docs(&self.0)
     }
+    fn banned_one(&self, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
+        crate::ctl::banned_doc_for(&self.0, ip)
+    }
     fn log(&self, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>, String> {
         crate::ctl::log_docs(&self.0, limit, ip)
     }
@@ -100,6 +107,9 @@ impl Backend for CtlBackend {
     }
     fn map_counts(&self) -> Result<(usize, usize), String> {
         crate::ctl::map_counts(&self.0)
+    }
+    fn db_counts(&self) -> Result<DbCounts, String> {
+        crate::ctl::db_counts(&self.0)
     }
     fn unban(
         &self,
@@ -430,12 +440,9 @@ fn one_block(ip: &str, backend: &dyn Backend) -> Response {
     let Ok(ip) = ip.parse::<Ipv4Addr>() else {
         return Response::error(400, "not an IPv4 address");
     };
-    let ip = ip.to_string();
-    match backend.banned() {
-        Ok(docs) => match docs.into_iter().find(|d| d.ip == ip) {
-            Some(d) => Response::json(200, to_json(&d)),
-            None => Response::error(404, "not blocked"),
-        },
+    match backend.banned_one(ip) {
+        Ok(Some(d)) => Response::json(200, to_json(&d)),
+        Ok(None) => Response::error(404, "not blocked"),
         Err(e) => Response::error(503, &e),
     }
 }
@@ -573,16 +580,19 @@ fn unban_response(out: &UnbanOutcome) -> Response {
 
 // ---------------------------------------------------------------- metrics
 
-/// The Prometheus page: counts read from the kernel, and nothing else.
+/// The Prometheus page: counts, and never an address.
 ///
-/// The block map is the state of the system, so every number here is either a
-/// kernel counter or a count of the map's entries. No address leaves the map and
-/// no database is read, so a scrape costs the same however long the audit log
-/// grows. A value that cannot be read is left out, never reported as 0.
+/// What is blocked now comes from the kernel (its counters, and a count of the
+/// block map's entries). History and learned state come from the daemon's SQLite
+/// database through counting queries (`COUNT`/`GROUP BY`, and the checkpointed
+/// counters), so a scrape's cost does not grow with the audit log. A value that
+/// cannot be read is left out, never reported as 0.
 fn metrics(backend: &dyn Backend) -> String {
     render_metrics(&MetricInputs {
         kernel: backend.kernel_counters(),
         blocked: backend.map_counts().ok(),
+        db: backend.db_counts().ok(),
+        now: crate::ctl::now(),
         version: env!("CARGO_PKG_VERSION"),
     })
 }
@@ -593,6 +603,10 @@ pub struct MetricInputs<'a> {
     pub kernel: Option<(u64, u64, u64)>,
     /// `(blocked now, of which permanent)` from the block map.
     pub blocked: Option<(usize, usize)>,
+    /// Counts from SQLite.
+    pub db: Option<DbCounts>,
+    /// For turning the checkpoint's age into a timestamp.
+    pub now: u32,
     pub version: &'a str,
 }
 
@@ -600,6 +614,9 @@ pub struct MetricInputs<'a> {
 pub fn render_metrics(m: &MetricInputs<'_>) -> String {
     let mut out = String::new();
     let mut family = |name: &str, kind: &str, help: &str, samples: &[(String, String)]| {
+        if samples.is_empty() {
+            return;
+        }
         out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n"));
         for (labels, value) in samples {
             out.push_str(&format!("{name}{labels} {value}\n"));
@@ -646,6 +663,75 @@ pub fn render_metrics(m: &MetricInputs<'_>) -> String {
             "Sources in the kernel block map with no expiry.",
             &one(permanent.to_string()),
         );
+    }
+    if let Some(d) = &m.db {
+        let mut samples = Vec::new();
+        for (window, rows) in [
+            ("1h", &d.blocks_1h),
+            ("24h", &d.blocks_24h),
+            ("7d", &d.blocks_7d),
+        ] {
+            for (reason, n) in rows {
+                samples.push((
+                    labels(&[("window", window), ("reason", reason)]),
+                    n.to_string(),
+                ));
+            }
+        }
+        family(
+            "tfps_blocks_logged",
+            "gauge",
+            "Blocks the daemon logged in the window, by reason.",
+            &samples,
+        );
+        family(
+            "tfps_apiban_feed_entries",
+            "gauge",
+            "Addresses on the APIBAN feed list.",
+            &one(d.apiban_feed.to_string()),
+        );
+        if let Some(t) = &d.traffic {
+            let samples: Vec<_> = t
+                .counters
+                .iter()
+                .filter_map(|(k, v)| v.map(|v| (labels(&[("counter", k)]), v.to_string())))
+                .collect();
+            family(
+                "tfps_traffic_total",
+                "counter",
+                "Daemon traffic counters as of its last checkpoint.",
+                &samples,
+            );
+            if let Some(age) = t.age_secs {
+                family(
+                    "tfps_checkpoint_timestamp_seconds",
+                    "gauge",
+                    "When the daemon last checkpointed, as a Unix time.",
+                    &one(m.now.saturating_sub(age).to_string()),
+                );
+            }
+        }
+        let l = &d.learned;
+        for (name, help, v) in [
+            (
+                "tfps_learned_pairs",
+                "Learned peer/destination pairs.",
+                l.pairs,
+            ),
+            ("tfps_learned_peers", "Peers with learned state.", l.peers),
+            (
+                "tfps_learned_countries",
+                "Destination countries seen.",
+                l.countries,
+            ),
+            (
+                "tfps_learned_intl_calls",
+                "International calls learned from.",
+                l.intl_calls,
+            ),
+        ] {
+            family(name, "gauge", help, &one(v.to_string()));
+        }
     }
     out
 }
@@ -830,6 +916,10 @@ mod tests {
                 Err("opening the block map: not found".into())
             }
         }
+        fn banned_one(&self, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
+            let ip = ip.to_string();
+            Ok(self.banned()?.into_iter().find(|d| d.ip == ip))
+        }
         fn log(&self, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>, String> {
             if !self.db {
                 return Err("no database".into());
@@ -856,6 +946,19 @@ mod tests {
         }
         fn kernel_counters(&self) -> Option<(u64, u64, u64)> {
             self.map.then_some((1000, 40, 3))
+        }
+        fn db_counts(&self) -> Result<DbCounts, String> {
+            if !self.db {
+                return Err("no database".into());
+            }
+            Ok(DbCounts {
+                blocks_1h: vec![("scanner".into(), 2)],
+                blocks_24h: vec![("scanner".into(), 5), ("weird \"reason\"\n".into(), 1)],
+                blocks_7d: vec![("scanner".into(), 9)],
+                apiban_feed: 2,
+                traffic: crate::ctl::traffic_doc(Some("udp=120 syn=40 bad=xx"), Some(1_000), 1_060),
+                learned: crate::ctl::learned_doc(5, 5, 3, 77),
+            })
         }
         fn map_counts(&self) -> Result<(usize, usize), String> {
             let docs = self.banned()?;
@@ -1320,7 +1423,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_parse_and_carry_the_kernels_counts() {
+    fn metrics_parse_and_carry_the_kernel_and_database_counts() {
         let r = route(&get("/metrics"), &up(), OFF);
         assert_eq!(r.status, 200);
         assert!(r.content_type.starts_with("text/plain; version=0.0.4"));
@@ -1331,40 +1434,71 @@ mod tests {
         assert_eq!(m["tfps_blocked_sources"], 4.0);
         assert_eq!(m["tfps_blocked_sources_permanent"], 2.0);
         assert_eq!(
+            m[r#"tfps_blocks_logged{window="1h",reason="scanner"}"#],
+            2.0
+        );
+        assert_eq!(
+            m[r#"tfps_blocks_logged{window="7d",reason="scanner"}"#],
+            9.0
+        );
+        assert_eq!(m["tfps_apiban_feed_entries"], 2.0);
+        assert_eq!(m[r#"tfps_traffic_total{counter="udp"}"#], 120.0);
+        assert!(
+            !m.keys().any(|k| k.contains(r#"counter="bad""#)),
+            "a counter that will not parse is left out"
+        );
+        assert_eq!(
+            m["tfps_checkpoint_timestamp_seconds"] as u32,
+            crate::ctl::now() - 60
+        );
+        assert_eq!(m["tfps_learned_intl_calls"], 77.0);
+        assert_eq!(
             m[&format!(
                 r#"tfps_build_info{{version="{}"}}"#,
                 env!("CARGO_PKG_VERSION")
             )],
             1.0
         );
-        assert_eq!(
-            m.len(),
-            6,
-            "nothing but kernel counts and the version: {m:?}"
-        );
     }
 
-    /// No address and no database: a scrape must not depend on how long the
-    /// audit log is, so the database being unreadable changes nothing.
+    /// Counts only: `/metrics` never builds the block listing, the stats
+    /// document or the log, which are the reads that carry addresses.
     #[test]
-    fn metrics_read_no_database() {
-        let no_db = Fake {
-            map: true,
-            ..Fake::default()
-        };
-        assert_eq!(
-            route(&get("/metrics"), &no_db, OFF).body,
-            route(&get("/metrics"), &up(), OFF).body
-        );
-        assert!(!fn_body("metrics").contains("stats()"));
-        assert!(!fn_body("metrics").contains("banned()"));
-        assert!(!fn_body("metrics").contains("log("));
+    fn metrics_read_counts_and_never_addresses() {
+        let body = fn_body("metrics");
+        for call in ["banned(", "banned_one(", "stats(", "log("] {
+            assert!(!body.contains(call), "{call} in metrics: {body}");
+        }
+        assert!(!route(&get("/metrics"), &up(), OFF)
+            .body
+            .contains("203.0.113."));
     }
 
     #[test]
     fn metrics_omit_what_cannot_be_read_and_never_report_it_as_zero() {
         let m = parse_prometheus(&route(&get("/metrics"), &Fake::default(), OFF).body);
         assert_eq!(m.len(), 1, "only build_info is left: {m:?}");
+        let no_db = Fake {
+            map: true,
+            ..Fake::default()
+        };
+        let m = parse_prometheus(&route(&get("/metrics"), &no_db, OFF).body);
+        assert!(
+            m.contains_key("tfps_blocked_sources"),
+            "the kernel half stands alone"
+        );
+        assert!(!m.keys().any(|k| k.starts_with("tfps_blocks_logged")
+            || k.starts_with("tfps_learned_")
+            || k.starts_with("tfps_traffic_")));
+    }
+
+    #[test]
+    fn a_reason_label_is_escaped_on_the_page() {
+        let body = route(&get("/metrics"), &up(), OFF).body;
+        assert!(
+            body.contains(r#"tfps_blocks_logged{window="24h",reason="weird \"reason\"\n"} 1"#),
+            "{body}"
+        );
     }
 
     #[test]

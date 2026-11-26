@@ -6,6 +6,11 @@ After=tfps.service
 # Installed but not enabled. It serves nothing until /etc/tfps/config.json has
 # "http": {"enabled": true}; without that it says so and exits 0, so enabling it
 # early is harmless. Turn it on with:  systemctl enable --now tfps-api
+#
+# The "http" section is read at start only. After editing it, including to turn
+# the API off, run:  systemctl restart tfps-api
+# Restarting tfps.service does not restart this one; that is deliberate, so the
+# API can be stopped or upgraded without touching enforcement.
 
 [Service]
 Type=simple

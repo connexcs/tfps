@@ -84,8 +84,10 @@ Configuration lives in `/etc/tfps/config.json`; every field is optional and the 
 
 The **optional JSON API** (blocks and their reasons over HTTP, plus Prometheus metrics) is
 installed as `tfps-api.service` but not enabled. Set `"http": {"enabled": true}` in the
-configuration, then `systemctl enable --now tfps-api`; it listens on `127.0.0.1:9060`. Read
-the README's "JSON API" section, its security model in particular, before exposing it.
+configuration, then `systemctl enable --now tfps-api`; it listens on `127.0.0.1:9060`. It
+reads the `http` section only when it starts, so after editing that section (including to
+turn the API off) run `systemctl restart tfps-api`: restarting `tfps` does not restart it.
+Read the README's "JSON API" section, its security model in particular, before exposing it.
 
 ## Pinning a version
 

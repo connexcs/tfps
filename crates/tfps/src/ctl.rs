@@ -161,14 +161,31 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
 /// manual record leaves rows unattributed rather than failing the listing:
 /// the blocks themselves are still the kernel's to report.
 pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
-    let b = open_blocklist(ctx)?;
-    let entries = b.entries();
-    // Both sets are loaded for the same reason the human path loads both: an
-    // address on the feed alone is attributable, and reading only the audit
-    // log reports it as unattributed.
-    // The audit log and the feed are asked only about what the map holds.
+    let entries = open_blocklist(ctx)?.entries();
+    Ok(attribute_entries(ctx, &entries))
+}
+
+/// `/v1/blocks/{ip}`: one address's document, or `None` when it is not blocked.
+///
+/// One key lookup in the map and lookups for that one address, not the whole
+/// listing: the same attribution as `banned_docs`, through the same function.
+pub fn banned_doc_for(ctx: &Ctx, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
+    let Some(until) = open_blocklist(ctx)?.get(ip) else {
+        return Ok(None);
+    };
+    Ok(attribute_entries(ctx, &[(ip, until)]).pop())
+}
+
+/// One `BannedDoc` per block map entry, in the order given.
+///
+/// The audit log and the feed are asked only about these addresses. Both are
+/// read for the same reason the human path reads both: an address on the feed
+/// alone is attributable, and reading only the audit log reports it as
+/// unattributed. An unreadable database or manual record leaves rows
+/// unattributed rather than failing: the blocks are still the kernel's to report.
+fn attribute_entries(ctx: &Ctx, entries: &[(Ipv4Addr, u64)]) -> Vec<BannedDoc> {
     let store = Store::open_readonly(&ctx.db).ok();
-    let among = map_addresses(&entries);
+    let among = map_addresses(entries);
     let (audit, newest) = audit_maps(
         store
             .as_ref()
@@ -184,7 +201,7 @@ pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
     let now_wall = now();
     let now_mono = monotonic_ns();
     let mut docs = Vec::with_capacity(entries.len());
-    for (ip, until) in &entries {
+    for (ip, until) in entries {
         let ip_s = ip.to_string();
         let (why, first_seen) = banned_attribution(&ip_s, &audit, &apiban);
         let expires = expires_epoch(*until, now_wall, now_mono);
@@ -197,7 +214,7 @@ pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
         };
         docs.push(doc);
     }
-    Ok(docs)
+    docs
 }
 
 /// `log --json`: the block audit log, newest first, at most `limit` rows,
@@ -225,6 +242,40 @@ pub fn map_counts(ctx: &Ctx) -> Result<(usize, usize), String> {
     let entries = open_blocklist(ctx)?.entries();
     let permanent = entries.iter().filter(|(_, until)| *until == 0).count();
     Ok((entries.len(), permanent))
+}
+
+/// What `/metrics` reads from SQLite: counts only, never an address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbCounts {
+    /// Blocks logged per reason in the last hour, day and week.
+    pub blocks_1h: Vec<(String, u32)>,
+    pub blocks_24h: Vec<(String, u32)>,
+    pub blocks_7d: Vec<(String, u32)>,
+    /// Addresses on the APIBAN feed.
+    pub apiban_feed: usize,
+    /// The daemon's traffic counters as of its last checkpoint, `None` before
+    /// the first one.
+    pub traffic: Option<TrafficDoc>,
+    pub learned: LearnedDoc,
+}
+
+/// The SQLite half of `/metrics`: `COUNT`/`GROUP BY` queries and the daemon's
+/// checkpointed counters. No row that names an address is read.
+pub fn db_counts(ctx: &Ctx) -> Result<DbCounts, String> {
+    let s = Store::open_readonly(&ctx.db)?;
+    let now = now();
+    let window = |since: u32| s.blocks_by_reason(now.saturating_sub(since));
+    let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
+    let (pairs, peers, _) = s.totals()?;
+    let (countries, intl_calls) = s.country_spread()?;
+    Ok(DbCounts {
+        blocks_1h: window(3600)?,
+        blocks_24h: window(86_400)?,
+        blocks_7d: window(604_800)?,
+        apiban_feed: s.apiban_count()?,
+        traffic: traffic_doc(s.meta_get("stats").as_deref(), stats_ts, now),
+        learned: learned_doc(pairs, peers, countries, intl_calls),
+    })
 }
 
 /// Which blocks `unban_docs` lifts.
@@ -431,7 +482,7 @@ pub struct KernelDoc {
 /// still tells a consumer the daemon reported that counter, and dropping it
 /// would leave "the daemon never wrote this" and "this line is corrupt"
 /// indistinguishable.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TrafficDoc {
     pub age_secs: Option<u32>,
     pub counters: std::collections::BTreeMap<String, Option<u64>>,
@@ -491,7 +542,7 @@ pub struct StatsDoc {
 /// twice — they are always equal today. Both are carried because both are what
 /// the human view shows; if that query is ever split, these fields start
 /// carrying two different numbers without a contract change.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LearnedDoc {
     pub pairs: u32,
     pub peers: u32,
@@ -1918,9 +1969,17 @@ mod tests {
 
     #[test]
     fn banned_docs_consults_the_manual_record() {
-        let body = fn_body("banned_docs");
+        // Attribution lives in one place, and both the listing and the
+        // single-address lookup go through it, so they cannot disagree.
+        let src = include_str!("ctl.rs");
+        let at = src
+            .find("\nfn attribute_entries(")
+            .expect("attribute_entries");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("ends")];
         assert!(body.contains("manual_record(ctx,"), "{body}");
         assert!(body.contains("manual_attribution("), "{body}");
+        assert!(fn_body("banned_docs").contains("attribute_entries("));
+        assert!(fn_body("banned_doc_for").contains("attribute_entries("));
     }
 
     #[test]

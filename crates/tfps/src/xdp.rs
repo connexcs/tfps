@@ -408,6 +408,12 @@ impl Blocklist {
         out
     }
 
+    /// One address's entry: `Some(until)` when it is blocked (`0` = no expiry),
+    /// `None` when it is not. A single key lookup, not a walk of the map.
+    pub fn get(&self, ip: Ipv4Addr) -> Option<u64> {
+        self.map.get(&self.key(ip), 0).ok()
+    }
+
     /// Lifts a block. Returns whether the address was there — an operator who typos an
     /// address must be told nothing happened, not left believing they unbanned someone.
     pub fn remove(&mut self, ip: Ipv4Addr) -> Result<bool, String> {
