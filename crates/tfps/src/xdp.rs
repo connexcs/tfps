@@ -55,6 +55,11 @@ pub struct Enforcer {
     /// Human-readable description of where enforcement is happening — it goes into the
     /// report, because the operator needs to know who is doing the blocking.
     pub mode: String,
+    /// How our own program is attached (`"native (DRV)"`, `"generic (SKB)"`) and
+    /// where; `None` when enforcing through a shared map.
+    pub attach: Option<(String, String)>,
+    /// The pin path, when enforcing through a shared map.
+    shared_pin: Option<std::path::PathBuf>,
 }
 
 /// Counters read from the kernel.
@@ -104,6 +109,8 @@ impl Enforcer {
             mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
             backend: Backend::Shared { map },
+            attach: None,
+            shared_pin: Some(path.to_path_buf()),
         })
     }
 
@@ -161,9 +168,32 @@ impl Enforcer {
             mode: format!("own program, XDP {mode} on {iface}"),
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
+            attach: Some((mode.to_string(), iface.to_string())),
+            shared_pin: None,
         };
         me.publish_ports(ports)?;
         Ok(me)
+    }
+
+    /// The map this enforcer writes to, as the daemon publishes it in its state
+    /// file: the pin path of a shared map, or the kernel id of our own `blocked`.
+    pub fn active_map(&self) -> Result<crate::state::ActiveMap, String> {
+        match (&self.backend, &self.shared_pin) {
+            (Backend::Shared { .. }, Some(pin)) => {
+                Ok(crate::state::ActiveMap::Shared { pin: pin.clone() })
+            }
+            (Backend::Shared { .. }, None) => Err("a shared map without its pin path".into()),
+            (Backend::Own { bpf }, _) => {
+                let data = match bpf.map("blocked").ok_or("map `blocked` is missing")? {
+                    Map::LruHashMap(d) | Map::HashMap(d) => d,
+                    _ => return Err("map `blocked` is not a hash map".into()),
+                };
+                let info = data
+                    .info()
+                    .map_err(|e| format!("reading map `blocked`'s id: {e}"))?;
+                Ok(crate::state::ActiveMap::Own { id: info.id() })
+            }
+        }
     }
 
     fn publish_ports(&mut self, ports: &[u16]) -> Result<(), String> {
@@ -313,27 +343,49 @@ impl Blocklist {
         Self::open_own()
     }
 
-    /// The map the daemon enforces through when it was given a shared map (`drop_map`
-    /// or `--drop-map`): that pin when it exists and opens, else the daemon's own map.
+    /// The map the running daemon enforces through, as its state file names it.
     ///
-    /// The same test `Enforcer::attach` applies. A pin that is present but unusable
-    /// (stale, or not a `hash<u32,u64>`) makes the daemon fall back to its own map,
-    /// so reading that pin instead would show, and unban from, a map nothing enforces.
-    ///
-    /// The fallback goes **straight to the daemon's own map**, not through
-    /// [`Blocklist::open`]'s usual lookup: that lookup tries the default shared pin
-    /// first, which the daemon never considers once it has been given another one.
-    pub fn open_preferring(pin: &Path) -> Result<Self, String> {
-        if pin.exists() {
-            if let Ok(map) = Self::open_pin(pin) {
-                return Ok(Self {
-                    map,
-                    big_endian: true,
-                    source: format!("shared map {}", pin.display()),
-                });
+    /// Exactly that map, never a lookup of our own: a shared pin that appeared
+    /// after the daemon chose its own map, or a second map called `blocked`, must
+    /// not be read or edited in its place. No file means the daemon is not
+    /// running; enforcement it reports as inactive means there is no map.
+    pub fn open_from_state(path: &Path) -> Result<Self, String> {
+        match crate::state::read(path)?.map {
+            crate::state::ActiveMap::Shared { pin } => Ok(Self {
+                map: Self::open_pin(&pin)?,
+                big_endian: true,
+                source: format!("shared map {}", pin.display()),
+            }),
+            crate::state::ActiveMap::Own { id } => Self::open_by_id(id),
+            crate::state::ActiveMap::Inactive { reason } => {
+                Err(format!("enforcement is inactive: {reason}"))
             }
         }
-        Self::open_own()
+    }
+
+    /// The daemon's own map by kernel id, checked to still be a map called
+    /// `blocked`: an id outlives nothing, and the kernel may hand it to another
+    /// map after the daemon's is gone.
+    fn open_by_id(id: u32) -> Result<Self, String> {
+        let data = MapData::from_id(id).map_err(|e| {
+            format!("opening map id {id} (has tfps restarted without republishing?): {e}")
+        })?;
+        let name = data
+            .info()
+            .ok()
+            .and_then(|i| i.name_as_str().map(str::to_string));
+        if name.as_deref() != Some("blocked") {
+            return Err(format!(
+                "map id {id} is {name:?}, not tfps's `blocked`: the state file is stale"
+            ));
+        }
+        let map = BpfHashMap::try_from(Map::LruHashMap(data))
+            .map_err(|e| format!("map id {id} is not a hash<u32,u64>: {e}"))?;
+        Ok(Self {
+            map,
+            big_endian: false,
+            source: format!("own map id {id}"),
+        })
     }
 
     /// The daemon's own map, found by name.

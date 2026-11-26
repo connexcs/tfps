@@ -30,10 +30,10 @@ pub struct Ctx {
     pub db: PathBuf,
     /// An explicitly pinned block map (`--map`), or `None` for the usual lookup.
     pub map: Option<PathBuf>,
-    /// The daemon's configured shared map (`drop_map`), used when `map` is `None`:
-    /// tried first, and passed over for the usual lookup when it is absent or
-    /// unusable, exactly as the daemon does at startup.
-    pub shared_map: Option<PathBuf>,
+    /// The daemon's state file (`tfps::state`), used when `map` is `None`: the
+    /// block map is then exactly the one the running daemon enforces through.
+    /// `None` keeps the usual lookup, as the command line has always done.
+    pub state: Option<PathBuf>,
     /// The configuration file (`--config`), read for `manual_log_dir`.
     pub config: PathBuf,
 }
@@ -43,7 +43,7 @@ impl Default for Ctx {
         Ctx {
             db: PathBuf::from(crate::store::DEFAULT_PATH),
             map: None,
-            shared_map: None,
+            state: None,
             config: PathBuf::from(crate::config::DEFAULT_PATH),
         }
     }
@@ -73,12 +73,12 @@ pub fn audit_maps(
     (audit, newest)
 }
 
-/// The block map `ctx` names: an explicit pin as given, else the configured
-/// shared map with the daemon's fallback, else the usual lookup.
+/// The block map `ctx` names: an explicit pin as given, else the map the
+/// daemon's state file names, else the usual lookup.
 fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
-    match (&ctx.map, &ctx.shared_map) {
+    match (&ctx.map, &ctx.state) {
         (Some(pin), _) => Blocklist::open(Some(pin)),
-        (None, Some(shared)) => Blocklist::open_preferring(shared),
+        (None, Some(state)) => Blocklist::open_from_state(state),
         (None, None) => Blocklist::open(None),
     }
 }
@@ -93,7 +93,17 @@ fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
 pub fn status_docs(ctx: &Ctx) -> StatusDoc {
     let blocked = open_blocklist(ctx).and_then(|b| Ok((b.entries()?.len(), b.source)));
     let totals = Store::open_readonly(&ctx.db).and_then(|s| s.totals()).ok();
-    status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"))
+    let mut doc = status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"));
+    // Only the daemon knows how it attached; with a state file, say so.
+    if let Some(state) = ctx
+        .state
+        .as_deref()
+        .and_then(|p| crate::state::read(p).ok())
+    {
+        doc.mode = state.mode;
+        doc.interface = state.interface;
+    }
+    doc
 }
 
 /// `stats --json`: every counter, as one document.
@@ -1819,7 +1829,7 @@ mod tests {
         Ctx {
             db: dir.join("absent.db"),
             map: Some(dir.join("absent-map")),
-            shared_map: None,
+            state: None,
             config: dir.join("absent.json"),
         }
     }
@@ -1934,37 +1944,91 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
-    /// A configured shared map that is present but unusable is passed over for
-    /// the daemon's own map, as the daemon itself does; an explicit pin is not.
-    /// No kernel here, so each case is told apart by which open failed.
+    /// With a state file, the map is exactly the one it names, and nothing is
+    /// guessed when it cannot be used. No kernel here, so each case is told apart
+    /// by which error comes back.
     #[test]
-    fn an_unusable_shared_map_falls_back_like_the_daemon_and_an_explicit_pin_does_not() {
-        let stale = scratch_db("stale-pin");
-        std::fs::write(&stale, b"not a BPF pin").expect("write");
-        let open = |map: Option<&PathBuf>, shared: Option<&PathBuf>| {
+    fn the_state_file_decides_the_map_and_an_explicit_pin_overrides_it() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.json");
+        let open = |map: Option<PathBuf>| {
             let ctx = Ctx {
-                map: map.cloned(),
-                shared_map: shared.cloned(),
+                map,
+                state: Some(state.clone()),
                 ..nowhere()
             };
             open_blocklist(&ctx).err().expect("no kernel map here")
         };
-        let own = open(None, None);
-        assert_eq!(
-            open(None, Some(&stale)),
-            own,
-            "an unusable shared pin falls back to the usual lookup"
-        );
-        assert_eq!(
-            open(None, Some(&stale.with_extension("absent"))),
-            own,
-            "so does an absent one"
-        );
         assert!(
-            open(Some(&stale), None).contains(&stale.display().to_string()),
-            "an explicit pin is opened as given, with no fallback"
+            open(None).contains("not running"),
+            "no file: the daemon is not running"
         );
-        let _ = std::fs::remove_file(&stale);
+        let write = |map| {
+            crate::state::write(
+                &state,
+                &crate::state::State {
+                    pid: 1,
+                    started_at: 1,
+                    map,
+                    mode: None,
+                    interface: None,
+                },
+            )
+            .expect("write")
+        };
+        write(crate::state::ActiveMap::Inactive {
+            reason: "--no-enforce".into(),
+        });
+        assert!(
+            open(None).contains("inactive: --no-enforce"),
+            "{}",
+            open(None)
+        );
+        let pin = dir.join("shared-pin");
+        write(crate::state::ActiveMap::Shared { pin: pin.clone() });
+        assert!(
+            open(None).contains(&pin.display().to_string()),
+            "that pin, no fallback"
+        );
+        let explicit = dir.join("explicit-pin");
+        assert!(
+            open(Some(explicit.clone())).contains(&explicit.display().to_string()),
+            "--map beats the state file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_takes_mode_and_interface_from_the_state_file() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.json");
+        crate::state::write(
+            &state,
+            &crate::state::State {
+                pid: 1,
+                started_at: 1,
+                map: crate::state::ActiveMap::Inactive {
+                    reason: "test".into(),
+                },
+                mode: Some("generic (SKB)".into()),
+                interface: Some("eth1".into()),
+            },
+        )
+        .expect("write");
+        let d = status_docs(&Ctx {
+            state: Some(state),
+            ..nowhere()
+        });
+        assert_eq!(d.mode.as_deref(), Some("generic (SKB)"));
+        assert_eq!(d.interface.as_deref(), Some("eth1"));
+        assert_eq!(
+            status_docs(&nowhere()).mode,
+            None,
+            "no state file: still null"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

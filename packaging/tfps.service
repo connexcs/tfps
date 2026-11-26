@@ -7,6 +7,10 @@ Wants=network-online.target
 [Service]
 StateDirectory=tfps
 StateDirectoryMode=0700
+# Where tfps publishes the block map it enforces through (/run/tfps/state.json),
+# for tfps_ctl serve. systemd removes it when tfps stops, so the API then reports
+# "not running" instead of reading a map nothing enforces through.
+RuntimeDirectory=tfps
 UMask=0077
 Type=simple
 ExecStart=/usr/local/bin/tfps
