@@ -9,6 +9,7 @@
 
 pub mod apiban;
 pub mod config;
+pub mod ctl;
 pub mod guard;
 pub mod manual_log;
 pub mod store;
