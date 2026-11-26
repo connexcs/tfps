@@ -20,8 +20,8 @@ use std::process::ExitCode;
 use serde::Serialize;
 
 use tfps::ctl::{
-    action_doc, banned_docs, finite, log_docs, manual_attribution, manual_banned, manual_record,
-    newest_audit_ts, now, record_manual, stats_docs, status_docs, unban_docs, ActionDoc, Ctx,
+    action_doc, audit_maps, banned_docs, finite, log_docs, manual_attribution, manual_record,
+    map_addresses, now, record_manual, stats_docs, status_docs, unban_docs, ActionDoc, Ctx,
     UnbanOutcome, UnbanTarget,
 };
 use tfps::say;
@@ -57,6 +57,11 @@ SOURCE FILTERS:
   --country ISO                sources that have called this country, e.g. --country GB
   --limit N                    stop after N rows (default 50)
 
+HTTP API (off unless the configuration's \"http\" section enables it):
+  serve                        run the JSON API and /metrics in the foreground
+  --listen ADDR                IPv4 address:port (default: 127.0.0.1:9060)
+  --allow-unban                accept POST /v1/unban (default: off)
+
 GLOBAL:
   --db PATH                    database (default: {db})
   --map PATH                   an explicitly pinned block map
@@ -90,6 +95,13 @@ struct Args {
     source: Option<String>,
     /// Why, in the asker's words (`--reason`).
     reason: Option<String>,
+    /// `serve --listen`: overrides `http.listen`.
+    listen: Option<std::net::SocketAddrV4>,
+    /// `serve --allow-unban`: turns on `http.allow_unban`.
+    allow_unban: bool,
+    /// Whether `--db` was on the command line, so `serve` can tell an explicit
+    /// path from the default and let the configuration's `db` fill the latter.
+    db_given: bool,
 }
 
 impl Args {
@@ -99,6 +111,7 @@ impl Args {
         Ctx {
             db: self.db.clone(),
             map: self.map.clone(),
+            state: None,
             config: self.config.clone(),
         }
     }
@@ -122,6 +135,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         config: PathBuf::from(tfps::config::DEFAULT_PATH),
         source: None,
         reason: None,
+        listen: None,
+        allow_unban: false,
+        db_given: false,
     };
     let mut it = argv.iter();
     let value = |name: &str, it: &mut std::slice::Iter<'_, String>| -> Result<String, String> {
@@ -131,7 +147,10 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     };
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--db" => a.db = PathBuf::from(value("--db", &mut it)?),
+            "--db" => {
+                a.db = PathBuf::from(value("--db", &mut it)?);
+                a.db_given = true;
+            }
             "--map" => a.map = Some(PathBuf::from(value("--map", &mut it)?)),
             "--config" => a.config = PathBuf::from(value("--config", &mut it)?),
             "--peer" => a.peer = Some(value("--peer", &mut it)?),
@@ -161,6 +180,14 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 tfps::manual_log::check_reason(&v)?;
                 a.reason = Some(v);
             }
+            "--listen" => {
+                a.listen = Some(
+                    value("--listen", &mut it)?
+                        .parse()
+                        .map_err(|e| format!("invalid --listen (IPv4 address:port): {e}"))?,
+                )
+            }
+            "--allow-unban" => a.allow_unban = true,
             "-h" | "--help" => return Err(String::new()),
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other if a.command.is_empty() => a.command = other.to_string(),
@@ -175,6 +202,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     if (a.source.is_some() || a.reason.is_some()) && !matches!(a.command.as_str(), "ban" | "unban")
     {
         return Err("--source and --reason apply to ban and unban only".into());
+    }
+    if (a.listen.is_some() || a.allow_unban) && a.command != "serve" {
+        return Err("--listen and --allow-unban apply to serve only".into());
+    }
+    if a.json && a.command == "serve" {
+        return Err("serve answers in JSON over HTTP; --json does not apply".into());
     }
     Ok(a)
 }
@@ -205,6 +238,7 @@ fn main() -> ExitCode {
         "countries" => countries(&args),
         "log" => log(&args),
         "forget" => forget(&args),
+        "serve" => serve(&args),
         other => Err(format!("unknown command: {other}")),
     };
     match r {
@@ -236,11 +270,10 @@ fn status(args: &Args) -> Result<(), String> {
         }
         Err(e) => say!("learned state     : unavailable — {e}"),
     }
-    match Blocklist::open(args.map.as_deref()) {
-        Ok(b) => {
-            let e = b.entries();
+    match Blocklist::open(args.map.as_deref()).and_then(|b| Ok((b.entries()?, b.source))) {
+        Ok((e, source)) => {
             let permanent = e.iter().filter(|(_, until)| *until == 0).count();
-            say!("enforcement       : {}", b.source);
+            say!("enforcement       : {source}");
             say!(
                 "blocked now       : {} ({permanent} without expiry)",
                 e.len()
@@ -283,17 +316,13 @@ fn stats(args: &Args) -> Result<(), String> {
         Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
     }
     let s = Store::open_readonly(&args.db)?;
-    let apiban = s.apiban_all().unwrap_or_default();
-    // A perimeter block often lands on an IP that is also on the feed; attribute it to the
-    // reason we condemned it (the audit log), not to the feed it happens to appear on.
-    let audit: std::collections::HashSet<String> = s
-        .blocks(1_000_000, None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r.ip)
-        .collect();
-    if let Ok(b) = Blocklist::open(args.map.as_deref()) {
-        let e = b.entries();
+    if let Ok(e) = Blocklist::open(args.map.as_deref()).and_then(|b| b.entries()) {
+        // A perimeter block often lands on an IP that is also on the feed; attribute it to the
+        // reason we condemned it (the audit log), not to the feed it happens to appear on.
+        // Both are asked only about the addresses in the map.
+        let among = map_addresses(&e);
+        let audit = s.logged_among(&among).unwrap_or_default();
+        let apiban = s.apiban_among(&among).unwrap_or_default();
         let perimeter = e
             .iter()
             .filter(|(ip, _)| audit.contains(&ip.to_string()))
@@ -366,7 +395,7 @@ fn stats(args: &Args) -> Result<(), String> {
     say!(
         "  {:<16} {:>10}  {}",
         "apiban (feed)",
-        apiban.len(),
+        s.apiban_count().unwrap_or(0),
         "permanent, not audit-logged"
     );
     for (label, since) in [
@@ -438,8 +467,7 @@ fn banned(args: &Args) -> Result<(), String> {
         }
         return Ok(());
     }
-    let b = Blocklist::open(args.map.as_deref())?;
-    let entries = b.entries();
+    let entries = Blocklist::open(args.map.as_deref())?.entries()?;
     if entries.is_empty() {
         say!("nothing is blocked");
         return Ok(());
@@ -447,25 +475,22 @@ fn banned(args: &Args) -> Result<(), String> {
     // Attribute each block once, block_log winning over the APIBAN feed — a scanner is
     // often on both (APIBAN's honeypots catch the same tools), and the *reason* we
     // condemned it is the perimeter one, not the feed. Load both sets once.
+    // The audit log and the feed are asked only about the addresses in the map.
     let store = Store::open_readonly(&args.db).ok();
+    let among = map_addresses(&entries);
     let apiban = store
         .as_ref()
-        .and_then(|s| s.apiban_all().ok())
+        .and_then(|s| s.apiban_among(&among).ok())
         .unwrap_or_default();
-    // ip -> (reason, detail), most recent block per ip (rows come newest-first).
-    let mut audit: std::collections::HashMap<String, (String, String)> =
-        std::collections::HashMap::new();
+    // ip -> (reason, detail, first_seen) from its most recent block, and ip -> that block's time.
+    let (audit, newest) = audit_maps(
+        store
+            .as_ref()
+            .and_then(|s| s.block_summaries(&among).ok())
+            .unwrap_or_default(),
+    );
     let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
     let manual = manual_record(&args.ctx(), &wanted);
-    let mut newest: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    if let Some(s) = store.as_ref() {
-        if let Ok(rows) = s.blocks(1_000_000, None) {
-            newest = newest_audit_ts(&rows, &manual_banned(&manual));
-            for r in rows {
-                audit.entry(r.ip).or_insert((r.reason, r.detail));
-            }
-        }
-    }
 
     let now_ns = monotonic_ns();
     let (mut n_perimeter, mut n_apiban, mut n_unknown) = (0usize, 0usize, 0usize);
@@ -489,7 +514,7 @@ fn banned(args: &Args) -> Result<(), String> {
         }
         let why = if let Some((_, detail, source)) = by_manual {
             format!("manual ({detail}) by {source}")
-        } else if let Some((reason, detail)) = by_audit {
+        } else if let Some((reason, detail, _)) = by_audit {
             format!("{reason} ({detail})")
         } else if by_feed {
             "apiban (feed)".to_string()
@@ -1192,6 +1217,121 @@ fn forget(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
+/// `serve`: the JSON API, in the foreground, until the process is stopped.
+///
+/// Off unless the configuration enables it, and then it says so and exits 0, so
+/// the unit can be installed and left alone without systemd restarting it.
+fn serve(args: &Args) -> Result<(), String> {
+    let (http, config_db) = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => (c.http.unwrap_or_default(), c.db),
+        tfps::config::Loaded::Absent => (tfps::config::HttpConfig::default(), None),
+        // A broken file must not quietly turn into "the API is off".
+        tfps::config::Loaded::Broken(e) => return Err(e),
+    };
+    let Some((listen, opts)) = serve_settings(&http, args.listen, args.allow_unban)? else {
+        say!(
+            "the HTTP API is off: set \"http\": {{\"enabled\": true}} in {} to serve it",
+            args.config.display()
+        );
+        return Ok(());
+    };
+    let listener =
+        std::net::TcpListener::bind(listen).map_err(|e| format!("listening on {listen}: {e}"))?;
+    if let Some(w) = tfps::api::bind_warning(listen, opts.allow_unban) {
+        eprintln!("{w}");
+    }
+    eprintln!(
+        "tfps_ctl serve: listening on http://{listen}/ (unban over HTTP: {})",
+        if opts.allow_unban { "on" } else { "off" }
+    );
+    tfps::api::serve(
+        listener,
+        std::sync::Arc::new(tfps::api::CtlBackend(serve_ctx(args, config_db))),
+        opts,
+    )
+    .map_err(|e| format!("serving: {e}"))
+}
+
+/// The paths `serve` reads: the state the running daemon uses.
+///
+/// - Database: `--db`, else the configuration's `db`, else the default, as the
+///   daemon resolves it.
+/// - Block map: `--map`, else exactly the map the daemon published in its state
+///   file (`tfps::state`). The daemon chooses its map once, at startup; the API
+///   never works that choice out again, so it cannot drift to a map the daemon
+///   is not enforcing through.
+///
+/// The unit runs `serve` with no flags, so without this an installation whose
+/// daemon uses a configured `db` or `drop_map` would be served from different
+/// state, and unbans would land in the wrong map and the wrong record.
+fn serve_ctx(args: &Args, config_db: Option<PathBuf>) -> Ctx {
+    let mut ctx = args.ctx();
+    if !args.db_given {
+        if let Some(db) = config_db {
+            ctx.db = db;
+        }
+    }
+    if args.map.is_none() {
+        ctx.state = Some(PathBuf::from(tfps::state::DEFAULT_PATH));
+    }
+    ctx
+}
+
+/// The listen address and options `serve` runs with, or `None` when the API is
+/// off. The command line beats the file, which beats the default; neither flag
+/// turns the API on by itself, so `enabled` stays the one switch.
+///
+/// Refuses to start rather than run exposed by mistake: a non-loopback address
+/// needs `allow_remote`, and a token file must hold a token and be readable by
+/// its owner only.
+fn serve_settings(
+    http: &tfps::config::HttpConfig,
+    listen: Option<std::net::SocketAddrV4>,
+    allow_unban: bool,
+) -> Result<Option<(std::net::SocketAddrV4, tfps::api::Options)>, String> {
+    if !http.enabled {
+        return Ok(None);
+    }
+    let listen = listen.unwrap_or(http.listen);
+    if !listen.ip().is_loopback() && !http.allow_remote {
+        return Err(format!(
+            "listening on {listen} would expose the API beyond this host; \
+             set \"allow_remote\": true in the http section to mean it"
+        ));
+    }
+    let token = http.token_file.as_deref().map(read_token).transpose()?;
+    Ok(Some((
+        listen,
+        tfps::api::Options::new(
+            allow_unban || http.allow_unban,
+            tfps::api::allowed_hosts(listen, &http.hosts),
+            token,
+        ),
+    )))
+}
+
+/// The bearer token in `path`: its first line, trimmed. Refused when the file
+/// is empty or readable by anyone but its owner, since anyone who can read it
+/// can use the API.
+fn read_token(path: &Path) -> Result<String, String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let meta =
+        std::fs::metadata(path).map_err(|e| format!("token_file {}: {e}", path.display()))?;
+    if meta.permissions().mode() & 0o077 != 0 {
+        return Err(format!(
+            "token_file {} is readable by others; chmod 600 it",
+            path.display()
+        ));
+    }
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("token_file {}: {e}", path.display()))?;
+    let token = text.lines().next().unwrap_or("").trim();
+    if token.is_empty() {
+        return Err(format!("token_file {} is empty", path.display()));
+    }
+    Ok(token.to_string())
+}
+
 // ---------------------------------------------------------------- helpers
 
 /// A compact duration. Operators read these in a column, so the widest case has to stay
@@ -1859,6 +1999,157 @@ mod tests {
              plain path; {calls} call(s) found, so one mode is silently losing the \
              specific kernel-failure reason again"
         );
+    }
+
+    #[test]
+    fn serve_flags_parse_and_belong_to_serve_only() {
+        let a = args(&["serve", "--listen", "0.0.0.0:8080", "--allow-unban"]).expect("parses");
+        assert_eq!(
+            a.listen.map(|l| l.to_string()).as_deref(),
+            Some("0.0.0.0:8080")
+        );
+        assert!(a.allow_unban);
+        assert!(args(&["status", "--allow-unban"]).is_err());
+        assert!(args(&["status", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(
+            args(&["serve", "--listen", "[::1]:9060"]).is_err(),
+            "IPv4 only"
+        );
+        assert!(args(&["serve", "--json"]).is_err());
+    }
+
+    #[test]
+    fn serve_runs_only_when_enabled_and_the_command_line_wins() {
+        let mut http = tfps::config::HttpConfig::default();
+        assert_eq!(
+            serve_settings(&http, None, true),
+            Ok(None),
+            "a flag does not turn it on"
+        );
+        http.enabled = true;
+        let (listen, opts) = serve_settings(&http, None, false).unwrap().expect("on");
+        assert_eq!(listen.to_string(), "127.0.0.1:9060");
+        assert!(
+            !opts.allow_unban,
+            "unban is a second switch, off by default"
+        );
+        assert_eq!(opts.hosts, ["127.0.0.1:9060", "localhost:9060"]);
+        assert_eq!(opts.token, None);
+        let other = "127.0.0.2:8080".parse().unwrap();
+        let (listen, opts) = serve_settings(&http, Some(other), true)
+            .unwrap()
+            .expect("on");
+        assert_eq!((listen, opts.allow_unban), (other, true));
+        http.allow_unban = true;
+        assert!(
+            serve_settings(&http, None, false)
+                .unwrap()
+                .expect("on")
+                .1
+                .allow_unban
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_listener_must_be_asked_for() {
+        let mut http = tfps::config::HttpConfig {
+            enabled: true,
+            hosts: vec!["TFPS.example.com".into()],
+            ..Default::default()
+        };
+        let remote = "0.0.0.0:9060".parse().unwrap();
+        let e = serve_settings(&http, Some(remote), false).expect_err("refused");
+        assert!(e.contains("allow_remote"), "{e}");
+        http.allow_remote = true;
+        let (_, opts) = serve_settings(&http, Some(remote), false)
+            .unwrap()
+            .expect("on");
+        assert_eq!(
+            opts.hosts,
+            ["0.0.0.0:9060", "tfps.example.com"],
+            "no localhost off loopback; extra names lower-cased"
+        );
+    }
+
+    #[test]
+    fn the_token_file_must_be_private_and_not_empty() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-token-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("token");
+        let set = |text: &str, mode: u32| {
+            std::fs::write(&file, text).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set("s3cret\n", 0o600);
+        assert_eq!(read_token(&file).as_deref(), Ok("s3cret"));
+        set("s3cret\n", 0o644);
+        assert!(read_token(&file).unwrap_err().contains("chmod 600"));
+        set("  \n", 0o600);
+        assert!(read_token(&file).unwrap_err().contains("empty"));
+        assert!(read_token(&dir.join("absent")).is_err());
+        let http = tfps::config::HttpConfig {
+            enabled: true,
+            token_file: Some(file.clone()),
+            ..Default::default()
+        };
+        set("abc\n", 0o600);
+        let (_, opts) = serve_settings(&http, None, false).unwrap().expect("on");
+        assert_eq!(opts.token.as_deref(), Some("abc"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_reads_the_database_the_daemon_writes() {
+        let configured = Some(PathBuf::from("/srv/tfps/state.db"));
+        let a = args(&["serve"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, configured.clone()).db,
+            Path::new("/srv/tfps/state.db")
+        );
+        assert_eq!(
+            serve_ctx(&a, None).db,
+            Path::new(tfps::store::DEFAULT_PATH),
+            "no db in the file: the default"
+        );
+        let a = args(&["serve", "--db", "/tmp/x.db"]).expect("parses");
+        assert_eq!(
+            serve_ctx(&a, configured).db,
+            Path::new("/tmp/x.db"),
+            "the command line beats the file"
+        );
+    }
+
+    #[test]
+    fn serve_reads_the_map_the_daemon_enforces_through() {
+        let a = args(&["serve"]).expect("parses");
+        let c = serve_ctx(&a, None);
+        assert_eq!(
+            (c.map, c.state),
+            (None, Some(PathBuf::from(tfps::state::DEFAULT_PATH))),
+            "the daemon's published map, not a lookup of our own"
+        );
+        let a = args(&["serve", "--map", "/sys/fs/bpf/other"]).expect("parses");
+        let c = serve_ctx(&a, None);
+        assert_eq!(
+            (c.map, c.state),
+            (Some(PathBuf::from("/sys/fs/bpf/other")), None),
+            "--map names the map outright"
+        );
+        assert_eq!(
+            args(&["banned"]).unwrap().ctx().state,
+            None,
+            "the CLI keeps its lookup"
+        );
+    }
+
+    #[test]
+    fn the_help_text_advertises_serve() {
+        let u = usage();
+        for w in ["serve", "--listen", "--allow-unban"] {
+            assert!(u.contains(w), "{w}");
+        }
     }
 
     #[test]

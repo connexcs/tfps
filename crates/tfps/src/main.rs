@@ -533,6 +533,8 @@ fn main() -> ExitCode {
         );
     }
     // Enforcement: load XDP, or say so loudly and carry on observing. Never pretend.
+    // `not_enforcing` says why, for the state file below.
+    let mut not_enforcing = String::from("--no-enforce");
     let mut enforcer = if args.no_enforce {
         say!("  enforcement       : OFF via --no-enforce (observe only)");
         None
@@ -555,12 +557,14 @@ fn main() -> ExitCode {
                 // SPEC §12 requirement: an anti-fraud system that appears to protect
                 // without protecting is exactly this project's criticism of the incumbent.
                 eprintln!("ALARM: enforcement INACTIVE — {err}");
+                not_enforcing = format!("enforcement failed to start: {err}");
                 eprintln!("       the system will OBSERVE but will NOT block anything.");
                 say!("  enforcement       : INACTIVE (see the alarm above)");
                 None
             }
         }
     };
+    publish_state(enforcer.as_ref(), &not_enforcing);
     say!(
         "  perimeter         : {ua_int} user-agents (+{ua_ext} from file), \
          {inj_int} injection patterns (+{inj_ext}), {scan_int} scanner ids (+{scan_ext})"
@@ -1297,6 +1301,44 @@ fn print_stats(e: &Engine, ports: &BTreeMap<u16, u64>, t: Timestamp, mode: Mode)
         e.source_count(),
         ports
     );
+}
+
+/// Publishes which block map this run enforces through, for `tfps_ctl serve`
+/// (`tfps::state`). The choice was made once, just above; the API uses exactly
+/// this map instead of working the choice out again.
+///
+/// Failing to write is not fatal to enforcement, but it is said: the API will
+/// report the daemon as not running until the file exists.
+fn publish_state(enforcer: Option<&xdp::Enforcer>, not_enforcing: &str) {
+    let inactive = |reason: String| tfps::state::ActiveMap::Inactive { reason };
+    let map = match enforcer.map(|e| e.active_map()) {
+        Some(Ok(map)) => map,
+        Some(Err(e)) => inactive(format!("could not identify the block map: {e}")),
+        None => inactive(not_enforcing.to_string()),
+    };
+    let (mode, interface) = match enforcer.and_then(|e| e.attach.clone()) {
+        Some((mode, iface)) => (Some(mode), Some(iface)),
+        None => (None, None),
+    };
+    let (pid, pid_start) = tfps::state::this_process();
+    let state = tfps::state::State {
+        pid,
+        pid_start,
+        counters: enforcer.and_then(|e| e.counters_id()),
+        started_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0),
+        map,
+        mode,
+        interface,
+    };
+    if let Err(e) = tfps::state::write(std::path::Path::new(tfps::state::DEFAULT_PATH), &state) {
+        eprintln!(
+            "WARNING: could not publish the enforcement state ({e}); \
+             tfps_ctl serve will report tfps as not running"
+        );
+    }
 }
 
 #[cfg(test)]

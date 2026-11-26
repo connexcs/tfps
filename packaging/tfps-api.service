@@ -1,0 +1,71 @@
+[Unit]
+Description=TFPS - optional JSON API and Prometheus metrics (tfps_ctl serve)
+Documentation=https://github.com/sippulse/tfps#json-api
+After=tfps.service
+
+# Installed but not enabled. It serves nothing until /etc/tfps/config.json has
+# "http": {"enabled": true}; without that it says so and exits 0, so enabling it
+# early is harmless. Turn it on with:  systemctl enable --now tfps-api
+#
+# The "http" section is read at start only. After editing it, including to turn
+# the API off, run:  systemctl restart tfps-api
+# Restarting tfps.service does not restart this one; that is deliberate, so the
+# API can be stopped or upgraded without touching enforcement.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tfps_ctl serve
+# Exits 0 when the API is off: do not restart it in a loop for that.
+Restart=on-failure
+RestartSec=5
+
+# Shares the daemon's state directory: it reads the database and, with
+# allow_unban, appends to the manual-action record beside it. It reads which
+# block map to use from /run/tfps/state.json, which tfps.service publishes.
+StateDirectory=tfps
+StateDirectoryMode=0700
+UMask=0077
+
+# Fewer capabilities than the daemon: no packet capture, no XDP attach.
+# CAP_BPF opens the block map. CAP_SYS_ADMIN is kept because the daemon's own map
+# is not pinned and is found by id, which on kernels with unprivileged BPF
+# disabled needs it. Drop it only after `curl 127.0.0.1:9060/v1/blocks` still
+# answers 200 without it on the target kernel.
+AmbientCapabilities=CAP_BPF CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_BPF CAP_SYS_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=full
+ReadOnlyPaths=/etc/tfps
+ProtectHome=yes
+PrivateTmp=yes
+
+# Further hardening. None of these is needed to open a BPF map, answer HTTP on
+# AF_INET or log to the journal over AF_UNIX, but they have not yet been run on
+# every supported kernel and systemd: if `systemctl status tfps-api` shows it
+# failing to start, or /v1/blocks answers 503 while `tfps_ctl banned` works,
+# remove them one at a time to find the one that matters there.
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+PrivateDevices=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_UNIX
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Measured with a simulated full block map (65,536 entries, `cargo run --release
+# -p tfps --example api_memory`): about 41 MB peak, with /v1/blocks listings taking
+# turns (one at a time) and streamed. One glibc malloc arena keeps it there; with
+# the default one per thread, four workers each keep a listing's worth (~160 MB).
+# The musl release build has no per-thread arenas and ignores this.
+Environment=MALLOC_ARENA_MAX=1
+MemoryMax=64M
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

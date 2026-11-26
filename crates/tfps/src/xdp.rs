@@ -13,7 +13,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapError, MapType};
 use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 
@@ -55,6 +55,12 @@ pub struct Enforcer {
     /// Human-readable description of where enforcement is happening — it goes into the
     /// report, because the operator needs to know who is doing the blocking.
     pub mode: String,
+    /// How our own program is attached (`"native (DRV)"`, `"generic (SKB)"`) and
+    /// where; `None` when enforcing through a shared map.
+    pub attach: Option<(String, String)>,
+    /// The pin path and the kernel id of the map opened from it, when enforcing
+    /// through a shared map.
+    shared: Option<(std::path::PathBuf, u32)>,
 }
 
 /// Counters read from the kernel.
@@ -97,27 +103,19 @@ impl Enforcer {
     fn use_shared(path: &Path) -> Result<Self, String> {
         // The pinned map is typically `lru_hash`; accepting `hash` as well lets this work
         // with any product that pins a compatible drop map.
-        let map = Self::open_pinned(path, true)
-            .or_else(|_| Self::open_pinned(path, false))
-            .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
+        // One open of the pin: the id published in the state file is read from
+        // the very map enforcement then uses, so a pin replaced at any moment,
+        // even straight after, cannot make the two differ.
+        let (map, id) =
+            open_hash(MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?)
+                .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
         Ok(Self {
             mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
             backend: Backend::Shared { map },
+            attach: None,
+            shared: Some((path.to_path_buf(), id)),
         })
-    }
-
-    pub(crate) fn open_pinned(
-        path: &Path,
-        lru: bool,
-    ) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-        let data = MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?;
-        let wrapped = if lru {
-            Map::LruHashMap(data)
-        } else {
-            Map::HashMap(data)
-        };
-        BpfHashMap::try_from(wrapped).map_err(|e| format!("{e}"))
     }
 
     fn load(obj: &Path, iface: &str, ports: &[u16]) -> Result<Self, String> {
@@ -161,9 +159,45 @@ impl Enforcer {
             mode: format!("own program, XDP {mode} on {iface}"),
             blocked_by_us: 0,
             backend: Backend::Own { bpf: Box::new(bpf) },
+            attach: Some((mode.to_string(), iface.to_string())),
+            shared: None,
         };
         me.publish_ports(ports)?;
         Ok(me)
+    }
+
+    /// The map this enforcer writes to, as the daemon publishes it in its state
+    /// file: the pin path of a shared map, or the kernel id of our own `blocked`.
+    pub fn active_map(&self) -> Result<crate::state::ActiveMap, String> {
+        match (&self.backend, &self.shared) {
+            (Backend::Shared { .. }, Some((pin, id))) => Ok(crate::state::ActiveMap::Shared {
+                pin: pin.clone(),
+                id: *id,
+            }),
+            (Backend::Shared { .. }, None) => Err("a shared map without its id".into()),
+            (Backend::Own { bpf }, _) => {
+                let data = match bpf.map("blocked").ok_or("map `blocked` is missing")? {
+                    Map::LruHashMap(d) | Map::HashMap(d) => d,
+                    _ => return Err("map `blocked` is not a hash map".into()),
+                };
+                let info = data
+                    .info()
+                    .map_err(|e| format!("reading map `blocked`'s id: {e}"))?;
+                Ok(crate::state::ActiveMap::Own { id: info.id() })
+            }
+        }
+    }
+
+    /// The kernel id of our own program's `counters` map, for the state file;
+    /// `None` for a shared map, whose counters belong to its owner.
+    pub fn counters_id(&self) -> Option<u32> {
+        let Backend::Own { bpf } = &self.backend else {
+            return None;
+        };
+        match bpf.map("counters")? {
+            Map::Array(d) => d.info().ok().map(|i| i.id()),
+            _ => None,
+        }
     }
 
     fn publish_ports(&mut self, ports: &[u16]) -> Result<(), String> {
@@ -310,6 +344,59 @@ impl Blocklist {
                 });
             }
         }
+        Self::open_own()
+    }
+
+    /// The map the running daemon enforces through, as its state file names it.
+    ///
+    /// Exactly that map, never a lookup of our own: a shared pin that appeared
+    /// after the daemon chose its own map, or a second map called `blocked`, must
+    /// not be read or edited in its place. No file means the daemon is not
+    /// running; enforcement it reports as inactive means there is no map.
+    pub fn open_from_state(path: &Path) -> Result<Self, String> {
+        match crate::state::read_live(path)?.map {
+            crate::state::ActiveMap::Shared { pin, id } => {
+                let map = open_hash_by_id(id)
+                    .map_err(|e| format!("the shared map ({}): {e}", pin.display()))?;
+                Ok(Self {
+                    map,
+                    big_endian: true,
+                    source: format!("shared map id {id} ({})", pin.display()),
+                })
+            }
+            crate::state::ActiveMap::Own { id } => Self::open_by_id(id),
+            crate::state::ActiveMap::Inactive { reason } => {
+                Err(format!("enforcement is inactive: {reason}"))
+            }
+        }
+    }
+
+    /// The daemon's own map by kernel id, checked to still be a map called
+    /// `blocked`: an id outlives nothing, and the kernel may hand it to another
+    /// map after the daemon's is gone.
+    fn open_by_id(id: u32) -> Result<Self, String> {
+        let data = MapData::from_id(id).map_err(|e| {
+            format!("opening map id {id} (has tfps restarted without republishing?): {e}")
+        })?;
+        let name = data
+            .info()
+            .ok()
+            .and_then(|i| i.name_as_str().map(str::to_string));
+        if name.as_deref() != Some("blocked") {
+            return Err(format!(
+                "map id {id} is {name:?}, not tfps's `blocked`: the state file is stale"
+            ));
+        }
+        drop(data);
+        Ok(Self {
+            map: open_hash_by_id(id)?,
+            big_endian: false,
+            source: format!("own map id {id}"),
+        })
+    }
+
+    /// The daemon's own map, found by name.
+    fn open_own() -> Result<Self, String> {
         let (id, map) = Self::open_by_name("blocked")?;
         Ok(Self {
             map,
@@ -319,8 +406,10 @@ impl Blocklist {
     }
 
     fn open_pin(p: &Path) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-        Enforcer::open_pinned(p, true)
-            .or_else(|_| Enforcer::open_pinned(p, false))
+        MapData::from_pin(p)
+            .map_err(|e| format!("opening pin: {e}"))
+            .and_then(open_hash)
+            .map(|(map, _)| map)
             .map_err(|e| format!("opening {}: {e}", p.display()))
     }
 
@@ -368,29 +457,38 @@ impl Blocklist {
     }
 
     /// Every condemned source, with the instant its block expires in monotonic ns
-    /// (`0` = never).
-    pub fn entries(&self) -> Vec<(Ipv4Addr, u64)> {
-        let mut out: Vec<(Ipv4Addr, u64)> = self
-            .map
-            .keys()
-            .filter_map(Result::ok)
-            .map(|k| (self.addr(k), self.map.get(&k, 0).unwrap_or(0)))
-            .collect();
-        out.sort_by_key(|(ip, _)| *ip);
-        out
+    /// (`0` = never), sorted by address.
+    ///
+    /// A key that disappears between being listed and being read (its block
+    /// expired or was lifted in between) is left out: it is no longer blocked. Any
+    /// other failure is an error. It is never turned into an expiry of `0`, which
+    /// would report the address as permanently blocked.
+    pub fn entries(&self) -> Result<Vec<(Ipv4Addr, u64)>, String> {
+        collect_entries(self.map.keys(), |k| self.map.get(&k, 0), |k| self.addr(k))
+    }
+
+    /// One address's entry: `Some(until)` when it is blocked (`0` = no expiry),
+    /// `None` when it is not. A single key lookup, not a walk of the map.
+    ///
+    /// Only a missing key is `None`. Any other failure is an error, so an
+    /// unreadable map is never reported as "not blocked".
+    pub fn get(&self, ip: Ipv4Addr) -> Result<Option<u64>, String> {
+        lookup_result(self.map.get(&self.key(ip), 0), ip)
     }
 
     /// Lifts a block. Returns whether the address was there — an operator who typos an
     /// address must be told nothing happened, not left believing they unbanned someone.
+    ///
+    /// Only a missing key is "was not there"; any other failure to read or remove
+    /// is an error, so a map that cannot be used is never reported as having
+    /// nothing to lift. A block that expires between the check and the removal
+    /// was not lifted by us, and reads as not there.
     pub fn remove(&mut self, ip: Ipv4Addr) -> Result<bool, String> {
         let k = self.key(ip);
-        if self.map.get(&k, 0).is_err() {
+        if lookup_result(self.map.get(&k, 0), ip)?.is_none() {
             return Ok(false);
         }
-        self.map
-            .remove(&k)
-            .map(|()| true)
-            .map_err(|e| format!("removing {ip}: {e}"))
+        removal_result(self.map.remove(&k), ip)
     }
 
     /// Condemns a source by hand, with the same TTL semantics the daemon uses.
@@ -421,14 +519,55 @@ pub fn live_counters() -> Result<Counters, String> {
         .find(|i| i.name_as_str() == Some("counters"))
         .map(|i| i.id())
         .ok_or("no loaded eBPF map called `counters` — is tfps running with enforcement?")?;
-    let data = MapData::from_id(id).map_err(|e| format!("opening counters map: {e}"))?;
+    counters_by_id(id)
+}
+
+/// The XDP counters in the map with kernel id `id`, as the daemon publishes it
+/// in its state file: exactly that map, never the first one with the name.
+pub fn counters_by_id(id: u32) -> Result<Counters, String> {
+    let data = MapData::from_id(id).map_err(|e| format!("opening counters map id {id}: {e}"))?;
+    let name = data
+        .info()
+        .ok()
+        .and_then(|i| i.name_as_str().map(str::to_string));
+    if name.as_deref() != Some("counters") {
+        return Err(format!("map id {id} is {name:?}, not tfps's `counters`"));
+    }
     let arr = Array::<_, u64>::try_from(Map::Array(data))
         .map_err(|e| format!("counters is not an array<u64>: {e}"))?;
+    read_counters(|i| arr.get(&i, 0))
+}
+
+/// The three counters, or an error if any of them cannot be read: a counter
+/// that could not be read is not reported as zero.
+fn read_counters(get: impl Fn(u32) -> Result<u64, MapError>) -> Result<Counters, String> {
+    let read = |i: u32, name: &str| get(i).map_err(|e| format!("reading counter {name}: {e}"));
     Ok(Counters {
-        dropped: arr.get(&C_DROPPED, 0).unwrap_or(0),
-        seen: arr.get(&C_SEEN, 0).unwrap_or(0),
-        expired: arr.get(&C_EXPIRED, 0).unwrap_or(0),
+        dropped: read(C_DROPPED, "dropped")?,
+        seen: read(C_SEEN, "seen")?,
+        expired: read(C_EXPIRED, "expired")?,
     })
+}
+
+/// A `hash<u32,u64>` block map by kernel id, LRU or plain.
+fn open_hash_by_id(id: u32) -> Result<BpfHashMap<MapData, u32, u64>, String> {
+    let data = MapData::from_id(id).map_err(|e| format!("opening map id {id}: {e}"))?;
+    open_hash(data)
+        .map(|(map, _)| map)
+        .map_err(|e| format!("map id {id}: {e}"))
+}
+
+/// An open map as a `hash<u32,u64>`, LRU or plain as the kernel says it is,
+/// with its kernel id, both taken from this one open handle.
+fn open_hash(data: MapData) -> Result<(BpfHashMap<MapData, u32, u64>, u32), String> {
+    let info = data.info().map_err(|e| format!("reading map info: {e}"))?;
+    let wrapped = match info.map_type() {
+        Ok(MapType::LruHash) => Map::LruHashMap(data),
+        Ok(MapType::Hash) => Map::HashMap(data),
+        other => return Err(format!("not a hash map: {other:?}")),
+    };
+    let map = BpfHashMap::try_from(wrapped).map_err(|e| format!("not a hash<u32,u64>: {e}"))?;
+    Ok((map, info.id()))
 }
 
 /// Every IPv4 address configured on this host.
@@ -476,9 +615,127 @@ pub fn default_interface() -> Option<String> {
     None
 }
 
+/// The body of `Blocklist::entries`, apart from the map, so the rules are
+/// testable without a kernel: a key deleted between listing and lookup is
+/// skipped, and every other error, while listing or while reading, is returned.
+fn collect_entries(
+    keys: impl Iterator<Item = Result<u32, MapError>>,
+    get: impl Fn(u32) -> Result<u64, MapError>,
+    addr: impl Fn(u32) -> Ipv4Addr,
+) -> Result<Vec<(Ipv4Addr, u64)>, String> {
+    let mut out = Vec::new();
+    for key in keys {
+        let key = key.map_err(|e| format!("listing the block map: {e}"))?;
+        let ip = addr(key);
+        if let Some(until) = lookup_result(get(key), ip)? {
+            out.push((ip, until));
+        }
+    }
+    out.sort_by_key(|(ip, _)| *ip);
+    Ok(out)
+}
+
+/// A map removal's answer: removed, a key already gone (it expired in between),
+/// or an error.
+fn removal_result(r: Result<(), MapError>, ip: Ipv4Addr) -> Result<bool, String> {
+    match r {
+        Ok(()) => Ok(true),
+        Err(MapError::KeyNotFound) => Ok(false),
+        Err(e) => Err(format!("removing {ip}: {e}")),
+    }
+}
+
+/// A map lookup's answer: the value, `None` for a key that is not there, and an
+/// error for anything else.
+fn lookup_result(r: Result<u64, MapError>, ip: Ipv4Addr) -> Result<Option<u64>, String> {
+    match r {
+        Ok(until) => Ok(Some(until)),
+        Err(MapError::KeyNotFound) => Ok(None),
+        Err(e) => Err(format!("reading the block map for {ip}: {e}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_deleted_mid_listing_is_skipped_and_never_reads_as_permanent() {
+        let addr = |k: u32| Ipv4Addr::from(k);
+        let keys = || [1u32, 2, 3].map(Ok).into_iter();
+        let got = collect_entries(
+            keys(),
+            |k| match k {
+                2 => Err(MapError::KeyNotFound),
+                _ => Ok(u64::from(k) * 10),
+            },
+            addr,
+        )
+        .expect("a vanished key is not an error");
+        assert_eq!(got, [(addr(1), 10), (addr(3), 30)], "no (addr(2), 0) entry");
+    }
+
+    #[test]
+    fn any_other_map_error_fails_the_listing() {
+        let addr = |k: u32| Ipv4Addr::from(k);
+        let err = collect_entries(
+            [1u32, 2].map(Ok).into_iter(),
+            |k| {
+                if k == 2 {
+                    Err(MapError::ElementNotFound)
+                } else {
+                    Ok(0)
+                }
+            },
+            addr,
+        );
+        assert!(err.is_err(), "a lookup failure is reported");
+        let err = collect_entries(
+            [Ok(1u32), Err(MapError::KeyNotFound)].into_iter(),
+            |_| Ok(0),
+            addr,
+        );
+        assert!(err.is_err(), "a listing failure is reported");
+    }
+
+    #[test]
+    fn a_counter_that_cannot_be_read_is_an_error_not_zero() {
+        let all = read_counters(|i| Ok(u64::from(i) + 10)).expect("readable");
+        assert_eq!(
+            (all.dropped, all.seen, all.expired),
+            (
+                u64::from(C_DROPPED) + 10,
+                u64::from(C_SEEN) + 10,
+                u64::from(C_EXPIRED) + 10
+            )
+        );
+        let e = read_counters(|i| {
+            if i == C_SEEN {
+                Err(MapError::KeyNotFound)
+            } else {
+                Ok(1)
+            }
+        })
+        .expect_err("one unreadable counter");
+        assert!(e.contains("seen"), "{e}");
+    }
+
+    #[test]
+    fn a_removal_tells_a_vanished_key_from_a_failure() {
+        let ip = Ipv4Addr::new(203, 0, 113, 1);
+        assert_eq!(removal_result(Ok(()), ip), Ok(true));
+        assert_eq!(removal_result(Err(MapError::KeyNotFound), ip), Ok(false));
+        assert!(removal_result(Err(MapError::ElementNotFound), ip).is_err());
+    }
+
+    #[test]
+    fn only_a_missing_key_reads_as_not_blocked() {
+        let ip = Ipv4Addr::new(203, 0, 113, 1);
+        assert_eq!(lookup_result(Ok(0), ip), Ok(Some(0)));
+        assert_eq!(lookup_result(Err(MapError::KeyNotFound), ip), Ok(None));
+        let e = lookup_result(Err(MapError::ElementNotFound), ip).expect_err("an error");
+        assert!(e.contains("203.0.113.1"), "{e}");
+    }
 
     #[test]
     fn monotonic_is_readable_and_nonzero() {

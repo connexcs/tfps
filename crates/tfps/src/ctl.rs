@@ -30,6 +30,10 @@ pub struct Ctx {
     pub db: PathBuf,
     /// An explicitly pinned block map (`--map`), or `None` for the usual lookup.
     pub map: Option<PathBuf>,
+    /// The daemon's state file (`tfps::state`), used when `map` is `None`: the
+    /// block map is then exactly the one the running daemon enforces through.
+    /// `None` keeps the usual lookup, as the command line has always done.
+    pub state: Option<PathBuf>,
     /// The configuration file (`--config`), read for `manual_log_dir`.
     pub config: PathBuf,
 }
@@ -39,8 +43,56 @@ impl Default for Ctx {
         Ctx {
             db: PathBuf::from(crate::store::DEFAULT_PATH),
             map: None,
+            state: None,
             config: PathBuf::from(crate::config::DEFAULT_PATH),
         }
+    }
+}
+
+/// The addresses in a block map read, as the store's lookups take them.
+pub fn map_addresses(entries: &[(Ipv4Addr, u64)]) -> std::collections::HashSet<String> {
+    entries.iter().map(|(ip, _)| ip.to_string()).collect()
+}
+
+/// The audit log's answers per address, split the way attribution uses them:
+/// `ip -> (reason, detail, first_seen)` for `banned_attribution`, and
+/// `ip -> newest block time` for `manual_attribution`.
+#[allow(clippy::type_complexity)]
+pub fn audit_maps(
+    summaries: std::collections::HashMap<String, crate::store::BlockSummary>,
+) -> (
+    std::collections::HashMap<String, (String, String, u32)>,
+    std::collections::HashMap<String, u32>,
+) {
+    let mut audit = std::collections::HashMap::with_capacity(summaries.len());
+    let mut newest = std::collections::HashMap::with_capacity(summaries.len());
+    for (ip, s) in summaries {
+        newest.insert(ip.clone(), s.newest);
+        audit.insert(ip, (s.reason, s.detail, s.first_seen));
+    }
+    (audit, newest)
+}
+
+/// The XDP program's `(seen, dropped, expired)`, `None` when they cannot all be
+/// read. With a state file, exactly the counters the running daemon published
+/// (none when it enforces through a shared map, whose counters are not ours);
+/// otherwise the command line's lookup by name.
+pub fn kernel_counters(ctx: &Ctx) -> Option<(u64, u64, u64)> {
+    let c = match &ctx.state {
+        Some(path) => crate::xdp::counters_by_id(crate::state::read_live(path).ok()?.counters?),
+        None => crate::xdp::live_counters(),
+    }
+    .ok()?;
+    Some((c.seen, c.dropped, c.expired))
+}
+
+/// The block map `ctx` names: an explicit pin as given, else the map the
+/// daemon's state file names, else the usual lookup.
+fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
+    match (&ctx.map, &ctx.state) {
+        (Some(pin), _) => Blocklist::open(Some(pin)),
+        (None, Some(state)) => Blocklist::open_from_state(state),
+        (None, None) => Blocklist::open(None),
     }
 }
 
@@ -52,9 +104,19 @@ impl Default for Ctx {
 /// Never fails: a map that will not open reads as `"inactive"`, and an
 /// unreadable database nulls the learned totals, as `StatusDoc` describes.
 pub fn status_docs(ctx: &Ctx) -> StatusDoc {
-    let blocked = Blocklist::open(ctx.map.as_deref()).map(|b| (b.entries().len(), b.source));
+    let blocked = open_blocklist(ctx).and_then(|b| Ok((b.entries()?.len(), b.source)));
     let totals = Store::open_readonly(&ctx.db).and_then(|s| s.totals()).ok();
-    status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"))
+    let mut doc = status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"));
+    // Only the daemon knows how it attached; with a state file, say so.
+    if let Some(state) = ctx
+        .state
+        .as_deref()
+        .and_then(|p| crate::state::read_live(p).ok())
+    {
+        doc.mode = state.mode;
+        doc.interface = state.interface;
+    }
+    doc
 }
 
 /// `stats --json`: every counter, as one document.
@@ -64,25 +126,23 @@ pub fn status_docs(ctx: &Ctx) -> StatusDoc {
 /// The kernel counters and the condemnation summary are `null` rather than an
 /// error when their maps cannot be read, as `StatsDoc` describes.
 pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
-    let kernel = crate::xdp::live_counters()
-        .ok()
-        .map(|c| (c.seen, c.dropped, c.expired));
+    let kernel = kernel_counters(ctx);
     let s = Store::open_readonly(&ctx.db)?;
-    let apiban = s.apiban_all().unwrap_or_default();
-    let audit: std::collections::HashSet<String> = s
-        .blocks(1_000_000, None)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| r.ip)
-        .collect();
     // `null`, not `(0, 0, 0)`, when the blocklist map cannot be opened —
     // the same reason `kernel` above is `None` rather than zeroed: a
     // consumer reading `condemned_now: 0` off a box whose map could not
     // even be opened would conclude nothing is blocked, the exact wrong
-    // reading this null is here to prevent.
-    let condemnation = Blocklist::open(ctx.map.as_deref())
+    // reading this null is here to prevent. The audit log and the feed are
+    // asked only about the addresses in the map.
+    let condemnation = open_blocklist(ctx)
+        .and_then(|b| b.entries())
         .ok()
-        .map(|b| condemnation_counts(&b.entries(), &audit, &apiban));
+        .map(|entries| {
+            let among = map_addresses(&entries);
+            let audit = s.logged_among(&among).unwrap_or_default();
+            let apiban = s.apiban_among(&among).unwrap_or_default();
+            condemnation_counts(&entries, &audit, &apiban)
+        });
     let now = now();
     let stats_line = s.meta_get("stats");
     let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
@@ -100,7 +160,7 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
     let (countries, intl_calls) = s.country_spread()?;
     let window = |since: u32| s.blocks_by_reason(now.saturating_sub(since));
     let blocks = blocks_doc(
-        apiban.len(),
+        s.apiban_count().unwrap_or(0),
         window(3600)?,
         window(86_400)?,
         window(604_800)?,
@@ -124,28 +184,47 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
 /// manual record leaves rows unattributed rather than failing the listing:
 /// the blocks themselves are still the kernel's to report.
 pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
-    let b = Blocklist::open(ctx.map.as_deref())?;
-    let entries = b.entries();
-    // Both sets are loaded for the same reason the human path loads both: an
-    // address on the feed alone is attributable, and reading only the audit
-    // log reports it as unattributed.
+    let entries = open_blocklist(ctx)?.entries()?;
+    Ok(attribute_entries(ctx, &entries))
+}
+
+/// `/v1/blocks/{ip}`: one address's document, or `None` when it is not blocked.
+///
+/// One key lookup in the map and lookups for that one address, not the whole
+/// listing: the same attribution as `banned_docs`, through the same function.
+pub fn banned_doc_for(ctx: &Ctx, ip: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
+    let Some(until) = open_blocklist(ctx)?.get(ip)? else {
+        return Ok(None);
+    };
+    Ok(attribute_entries(ctx, &[(ip, until)]).pop())
+}
+
+/// One `BannedDoc` per block map entry, in the order given.
+///
+/// The audit log and the feed are asked only about these addresses. Both are
+/// read for the same reason the human path reads both: an address on the feed
+/// alone is attributable, and reading only the audit log reports it as
+/// unattributed. An unreadable database or manual record leaves rows
+/// unattributed rather than failing: the blocks are still the kernel's to report.
+fn attribute_entries(ctx: &Ctx, entries: &[(Ipv4Addr, u64)]) -> Vec<BannedDoc> {
     let store = Store::open_readonly(&ctx.db).ok();
-    let rows = store
-        .as_ref()
-        .and_then(|s| s.blocks(1_000_000, None).ok())
-        .unwrap_or_default();
+    let among = map_addresses(entries);
+    let (audit, newest) = audit_maps(
+        store
+            .as_ref()
+            .and_then(|s| s.block_summaries(&among).ok())
+            .unwrap_or_default(),
+    );
     let wanted: std::collections::HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
     let manual = manual_record(ctx, &wanted);
-    let newest = newest_audit_ts(&rows, &manual_banned(&manual));
-    let audit = attribute_by_ip(rows);
     let apiban = store
         .as_ref()
-        .and_then(|s| s.apiban_all().ok())
+        .and_then(|s| s.apiban_among(&among).ok())
         .unwrap_or_default();
     let now_wall = now();
     let now_mono = monotonic_ns();
     let mut docs = Vec::with_capacity(entries.len());
-    for (ip, until) in &entries {
+    for (ip, until) in entries {
         let ip_s = ip.to_string();
         let (why, first_seen) = banned_attribution(&ip_s, &audit, &apiban);
         let expires = expires_epoch(*until, now_wall, now_mono);
@@ -158,7 +237,7 @@ pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
         };
         docs.push(doc);
     }
-    Ok(docs)
+    docs
 }
 
 /// `log --json`: the block audit log, newest first, at most `limit` rows,
@@ -177,6 +256,49 @@ pub fn log_docs(ctx: &Ctx, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>
         .iter()
         .map(|r| log_doc(r, None, None, true, "block"))
         .collect())
+}
+
+/// `(blocked now, of which permanent)`, counted from the block map alone. For
+/// `/metrics`: the map is the state of the system, and counting it reads no
+/// database and moves no address anywhere.
+pub fn map_counts(ctx: &Ctx) -> Result<(usize, usize), String> {
+    let entries = open_blocklist(ctx)?.entries()?;
+    let permanent = entries.iter().filter(|(_, until)| *until == 0).count();
+    Ok((entries.len(), permanent))
+}
+
+/// What `/metrics` reads from SQLite: counts only, never an address.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DbCounts {
+    /// Blocks logged per reason in the last hour, day and week.
+    pub blocks_1h: Vec<(String, u32)>,
+    pub blocks_24h: Vec<(String, u32)>,
+    pub blocks_7d: Vec<(String, u32)>,
+    /// Addresses on the APIBAN feed.
+    pub apiban_feed: usize,
+    /// The daemon's traffic counters as of its last checkpoint, `None` before
+    /// the first one.
+    pub traffic: Option<TrafficDoc>,
+    pub learned: LearnedDoc,
+}
+
+/// The SQLite half of `/metrics`: `COUNT`/`GROUP BY` queries and the daemon's
+/// checkpointed counters. No row that names an address is read.
+pub fn db_counts(ctx: &Ctx) -> Result<DbCounts, String> {
+    let s = Store::open_readonly(&ctx.db)?;
+    let now = now();
+    let window = |since: u32| s.blocks_by_reason(now.saturating_sub(since));
+    let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
+    let (pairs, peers, _) = s.totals()?;
+    let (countries, intl_calls) = s.country_spread()?;
+    Ok(DbCounts {
+        blocks_1h: window(3600)?,
+        blocks_24h: window(86_400)?,
+        blocks_7d: window(604_800)?,
+        apiban_feed: s.apiban_count()?,
+        traffic: traffic_doc(s.meta_get("stats").as_deref(), stats_ts, now),
+        learned: learned_doc(pairs, peers, countries, intl_calls),
+    })
 }
 
 /// Which blocks `unban_docs` lifts.
@@ -226,10 +348,13 @@ pub fn unban_docs(
         UnbanTarget::Addresses([]) => return Err("give at least one address, or --all".into()),
         UnbanTarget::Addresses(raw) => Some(parse_addresses(raw)?),
     };
-    let mut b = Blocklist::open(ctx.map.as_deref())?;
+    let mut b = open_blocklist(ctx)?;
     // A listing taken moments earlier is not a guarantee about now, so `--all`
     // reports what `remove` says was actually there, like the address form.
-    let ips = ips.unwrap_or_else(|| b.entries().into_iter().map(|(ip, _)| ip).collect());
+    let ips = match ips {
+        Some(ips) => ips,
+        None => b.entries()?.into_iter().map(|(ip, _)| ip).collect(),
+    };
     let (removed, failed) = remove_each(&ips, |ip| b.remove(ip));
     record_manual(ctx, &manual_unbans(&removed, source, reason, now()));
     let docs = removed
@@ -383,7 +508,7 @@ pub struct KernelDoc {
 /// still tells a consumer the daemon reported that counter, and dropping it
 /// would leave "the daemon never wrote this" and "this line is corrupt"
 /// indistinguishable.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TrafficDoc {
     pub age_secs: Option<u32>,
     pub counters: std::collections::BTreeMap<String, Option<u64>>,
@@ -443,7 +568,7 @@ pub struct StatsDoc {
 /// twice — they are always equal today. Both are carried because both are what
 /// the human view shows; if that query is ever split, these fields start
 /// carrying two different numbers without a contract change.
-#[derive(Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LearnedDoc {
     pub pairs: u32,
     pub peers: u32,
@@ -612,12 +737,10 @@ pub fn traffic_doc(line: Option<&str>, ts: Option<u32>, now: u32) -> Option<Traf
 /// document that rendered one command's times as integers and another's as
 /// formatted strings would make it guess which it had been handed.
 ///
-/// `first_seen` is read from the audit log via `Store::blocks(1_000_000, None)`,
-/// which is `ORDER BY ts DESC LIMIT 1000000`: on a box with more than a million
-/// audit rows the truncation drops the OLDEST rows, and those are precisely the
-/// ones `first_seen` reads from, so it would report the oldest row still within
-/// the limit rather than the oldest there is.
-#[derive(Serialize)]
+/// `first_seen` is the time of the oldest audit row for the address the log
+/// still holds, and `reason`/`detail` come from its newest row
+/// (`Store::block_summaries`, asked only about the addresses in the block map).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BannedDoc {
     pub ip: String,
     pub reason: Option<String>,
@@ -692,29 +815,6 @@ pub fn manual_attribution(
     Some(("manual".to_string(), detail, a.source.clone()))
 }
 
-/// The newest audit row's time for each address in `candidates`, from rows
-/// in any order.
-///
-/// Only addresses with a manual ban need it, so only those are looked up: with no
-/// manual bans the rows are not walked at all, and otherwise each row costs one
-/// lookup and allocates nothing unless it is a candidate.
-pub fn newest_audit_ts(
-    rows: &[BlockRow],
-    candidates: &std::collections::HashSet<String>,
-) -> std::collections::HashMap<String, u32> {
-    let mut m: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-    if candidates.is_empty() {
-        return m;
-    }
-    for r in rows {
-        if candidates.contains(r.ip.as_str()) {
-            let e = m.entry(r.ip.clone()).or_insert(r.ts);
-            *e = (*e).max(r.ts);
-        }
-    }
-    m
-}
-
 /// The manual-unban records for addresses `unban` actually removed.
 pub fn manual_unbans(
     removed: &[(Ipv4Addr, bool)],
@@ -755,17 +855,6 @@ pub fn manual_record(
     found.by_ip
 }
 
-/// The addresses whose latest manual action is a ban, as `newest_audit_ts` takes them.
-pub fn manual_banned(
-    manual: &std::collections::HashMap<Ipv4Addr, crate::manual_log::ManualAction>,
-) -> std::collections::HashSet<String> {
-    manual
-        .iter()
-        .filter(|(_, a)| a.verb == crate::manual_log::ManualVerb::Ban)
-        .map(|(ip, _)| ip.to_string())
-        .collect()
-}
-
 /// The record directory: `manual_log_dir` from the configuration file, else the
 /// database's directory; the same rule the daemon uses.
 pub fn manual_dir(ctx: &Ctx) -> std::path::PathBuf {
@@ -792,35 +881,6 @@ pub fn record_manual(ctx: &Ctx, actions: &[crate::manual_log::ManualAction]) {
             actions.len()
         );
     }
-}
-
-/// Attributes each ip to its most recent reason/detail and its earliest
-/// first-seen time, from a newest-first list of audit rows.
-///
-/// `reason`/`detail` take the newest row per ip — the same "most recent reason
-/// wins" precedence `--why` already uses in `tfps_ctl banned`'s human path.
-/// `first_seen` takes the OLDEST row instead: the plain meaning of the name
-/// is "when we first saw this source", not "when we most recently
-/// classified it". There is no equivalent "oldest wins" scan anywhere else
-/// in `tfps_ctl`; this is new logic and is pinned by its own test rather
-/// than only being exercised indirectly through `banned_doc`.
-///
-/// Assumes `rows` is ordered newest-first, exactly what `Store::blocks`
-/// returns: a running overwrite of `first_seen` on every subsequent
-/// occurrence of an ip converges on the oldest row by the time the scan
-/// ends, including across a duplicate timestamp.
-pub fn attribute_by_ip(
-    rows: Vec<BlockRow>,
-) -> std::collections::HashMap<String, (String, String, u32)> {
-    let mut audit: std::collections::HashMap<String, (String, String, u32)> =
-        std::collections::HashMap::new();
-    for r in rows {
-        audit
-            .entry(r.ip)
-            .and_modify(|(_, _, first_seen)| *first_seen = r.ts)
-            .or_insert((r.reason, r.detail, r.ts));
-    }
-    audit
 }
 
 /// Turns a kernel blocklist expiry into wall-clock epoch seconds, or `None`
@@ -1146,85 +1206,6 @@ mod tests {
         assert_eq!(
             crate::json_line(&bare).unwrap(),
             r#"{"ip":"198.51.100.12","reason":null,"detail":null,"first_seen":null,"expires":null,"enforced":true}"#
-        );
-    }
-
-    // The merge `banned --json` uses to turn a newest-first audit scan into a
-    // per-ip (rule, detail, first_seen): `rule`/`detail` take the newest row
-    // per ip; `first_seen` takes the OLDEST row instead. This is genuinely
-    // new logic (no equivalent "oldest wins" scan exists in the human path),
-    // so it is pinned directly rather than only through `banned_doc`, which
-    // never sees more than one row at a time.
-    #[test]
-    fn attribute_by_ip_takes_the_newest_reason_and_the_oldest_first_seen() {
-        let rows = vec![
-            // ip A: three rows for one source, arriving newest-first — the
-            // order `Store::blocks` actually returns.
-            BlockRow {
-                ts: 300,
-                ip: "198.51.100.10".to_string(),
-                reason: "scanner".to_string(),
-                detail: "d3".to_string(),
-            },
-            BlockRow {
-                ts: 200,
-                ip: "198.51.100.10".to_string(),
-                reason: "user-agent".to_string(),
-                detail: "d2".to_string(),
-            },
-            BlockRow {
-                ts: 100,
-                ip: "198.51.100.10".to_string(),
-                reason: "injection".to_string(),
-                detail: "d1".to_string(),
-            },
-            // ip B: a single row — its one row is both the newest and the
-            // oldest at once.
-            BlockRow {
-                ts: 500,
-                ip: "198.51.100.11".to_string(),
-                reason: "auth-failed".to_string(),
-                detail: "db".to_string(),
-            },
-            // ip C: two rows sharing one timestamp — a duplicate the merge
-            // must not choke on.
-            BlockRow {
-                ts: 400,
-                ip: "198.51.100.12".to_string(),
-                reason: "reg-scan".to_string(),
-                detail: "first".to_string(),
-            },
-            BlockRow {
-                ts: 400,
-                ip: "198.51.100.12".to_string(),
-                reason: "reg-scan".to_string(),
-                detail: "second".to_string(),
-            },
-        ];
-        let audit = attribute_by_ip(rows);
-
-        let a = audit.get("198.51.100.10").expect("ip A is present");
-        assert_eq!(a.0, "scanner", "rule takes the newest row");
-        assert_eq!(a.1, "d3", "detail takes the newest row");
-        assert_eq!(a.2, 100, "first_seen takes the OLDEST row, not the newest");
-
-        let b = audit.get("198.51.100.11").expect("ip B is present");
-        assert_eq!(
-            b,
-            &("auth-failed".to_string(), "db".to_string(), 500),
-            "a single row is both its own newest and its own oldest"
-        );
-
-        let c = audit.get("198.51.100.12").expect("ip C is present");
-        assert_eq!(
-            c.1, "first",
-            "a duplicate timestamp keeps the first row seen"
-        );
-        assert_eq!(c.2, 400, "first_seen still resolves across the duplicate");
-
-        assert!(
-            attribute_by_ip(Vec::new()).is_empty(),
-            "no audit rows means no attribution, not a panic"
         );
     }
 
@@ -1605,7 +1586,7 @@ mod tests {
 
     /// The perimeter/feed split `stats --json`'s condemnation summary uses,
     /// pinned directly with concrete addresses — the same reason
-    /// `attribute_by_ip` and `expires_epoch` above are tested on their own
+    /// `expires_epoch` above is tested on its own
     /// rather than only indirectly through `stats_doc`, which never sees more
     /// than the three already-computed counts.
     #[test]
@@ -1747,34 +1728,6 @@ mod tests {
         m
     }
 
-    fn row(ts: u32, ip: &str) -> BlockRow {
-        BlockRow {
-            ts,
-            ip: ip.to_string(),
-            reason: "user-agent".to_string(),
-            detail: "friendly-scanner".to_string(),
-        }
-    }
-
-    #[test]
-    fn the_newest_daemon_block_is_looked_up_only_for_manual_banned_addresses() {
-        let rows = [
-            row(300, "203.0.113.1"),
-            row(200, "203.0.113.2"),
-            row(100, "203.0.113.1"),
-        ];
-        let candidates: std::collections::HashSet<String> = ["203.0.113.1".to_string()].into();
-        let newest = newest_audit_ts(&rows, &candidates);
-        assert_eq!(newest.len(), 1, "{newest:?}");
-        assert_eq!(newest["203.0.113.1"], 300);
-    }
-
-    #[test]
-    fn with_no_manual_bans_the_audit_rows_are_not_walked_again() {
-        let rows = [row(300, "203.0.113.1")];
-        assert!(newest_audit_ts(&rows, &std::collections::HashSet::new()).is_empty());
-    }
-
     #[test]
     fn a_manual_ban_explains_a_block_nothing_else_explains() {
         let latest = latest_of(&[manual(
@@ -1887,6 +1840,7 @@ mod tests {
         Ctx {
             db: dir.join("absent.db"),
             map: Some(dir.join("absent-map")),
+            state: None,
             config: dir.join("absent.json"),
         }
     }
@@ -2001,6 +1955,102 @@ mod tests {
         let _ = std::fs::remove_file(&db);
     }
 
+    /// With a state file, the map is exactly the one it names, and nothing is
+    /// guessed when it cannot be used. No kernel here, so each case is told apart
+    /// by which error comes back.
+    #[test]
+    fn the_state_file_decides_the_map_and_an_explicit_pin_overrides_it() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.json");
+        let open = |map: Option<PathBuf>| {
+            let ctx = Ctx {
+                map,
+                state: Some(state.clone()),
+                ..nowhere()
+            };
+            open_blocklist(&ctx).err().expect("no kernel map here")
+        };
+        assert!(
+            open(None).contains("not running"),
+            "no file: the daemon is not running"
+        );
+        let this = crate::state::this_process();
+        let write = |map| {
+            crate::state::write(
+                &state,
+                &crate::state::State {
+                    pid: this.0,
+                    pid_start: this.1,
+                    started_at: 1,
+                    map,
+                    counters: None,
+                    mode: None,
+                    interface: None,
+                },
+            )
+            .expect("write")
+        };
+        write(crate::state::ActiveMap::Inactive {
+            reason: "--no-enforce".into(),
+        });
+        assert!(
+            open(None).contains("inactive: --no-enforce"),
+            "{}",
+            open(None)
+        );
+        let pin = dir.join("shared-pin");
+        write(crate::state::ActiveMap::Shared {
+            pin: pin.clone(),
+            id: 4_000_000,
+        });
+        let e = open(None);
+        assert!(
+            e.contains("map id 4000000") && e.contains(&pin.display().to_string()),
+            "the published id, not the pin path: {e}"
+        );
+        let explicit = dir.join("explicit-pin");
+        assert!(
+            open(Some(explicit.clone())).contains(&explicit.display().to_string()),
+            "--map beats the state file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_takes_mode_and_interface_from_the_state_file() {
+        let dir = std::env::temp_dir().join(format!("tfps-ctl-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let state = dir.join("state.json");
+        crate::state::write(
+            &state,
+            &crate::state::State {
+                pid: crate::state::this_process().0,
+                pid_start: crate::state::this_process().1,
+                started_at: 1,
+                counters: None,
+                map: crate::state::ActiveMap::Inactive {
+                    reason: "test".into(),
+                },
+                mode: Some("generic (SKB)".into()),
+                interface: Some("eth1".into()),
+            },
+        )
+        .expect("write");
+        let d = status_docs(&Ctx {
+            state: Some(state),
+            ..nowhere()
+        });
+        assert_eq!(d.mode.as_deref(), Some("generic (SKB)"));
+        assert_eq!(d.interface.as_deref(), Some("eth1"));
+        assert_eq!(
+            status_docs(&nowhere()).mode,
+            None,
+            "no state file: still null"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn banned_docs_fails_when_the_map_cannot_be_opened() {
         assert!(banned_docs(&nowhere()).is_err());
@@ -2008,9 +2058,17 @@ mod tests {
 
     #[test]
     fn banned_docs_consults_the_manual_record() {
-        let body = fn_body("banned_docs");
+        // Attribution lives in one place, and both the listing and the
+        // single-address lookup go through it, so they cannot disagree.
+        let src = include_str!("ctl.rs");
+        let at = src
+            .find("\nfn attribute_entries(")
+            .expect("attribute_entries");
+        let body = &src[at..at + src[at..].find("\n}\n").expect("ends")];
         assert!(body.contains("manual_record(ctx,"), "{body}");
         assert!(body.contains("manual_attribution("), "{body}");
+        assert!(fn_body("banned_docs").contains("attribute_entries("));
+        assert!(fn_body("banned_doc_for").contains("attribute_entries("));
     }
 
     #[test]
