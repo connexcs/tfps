@@ -13,7 +13,7 @@
 use std::net::Ipv4Addr;
 use std::path::Path;
 
-use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapError};
+use aya::maps::{Array, HashMap as BpfHashMap, Map, MapData, MapError, MapType};
 use aya::programs::{Xdp, XdpMode};
 use aya::Ebpf;
 
@@ -103,14 +103,12 @@ impl Enforcer {
     fn use_shared(path: &Path) -> Result<Self, String> {
         // The pinned map is typically `lru_hash`; accepting `hash` as well lets this work
         // with any product that pins a compatible drop map.
-        let map = Self::open_pinned(path, true)
-            .or_else(|_| Self::open_pinned(path, false))
-            .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
-        // The id of the map just opened, read from the same pin straight after,
-        // so the state file can name this map even if the pin is replaced later.
-        let id = aya::maps::MapInfo::from_pin(path)
-            .map_err(|e| format!("reading the id of {}: {e}", path.display()))?
-            .id();
+        // One open of the pin: the id published in the state file is read from
+        // the very map enforcement then uses, so a pin replaced at any moment,
+        // even straight after, cannot make the two differ.
+        let (map, id) =
+            open_hash(MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?)
+                .map_err(|e| format!("map is not a hash<u32,u64>: {e}"))?;
         Ok(Self {
             mode: format!("shared map {}", path.display()),
             blocked_by_us: 0,
@@ -118,19 +116,6 @@ impl Enforcer {
             attach: None,
             shared: Some((path.to_path_buf(), id)),
         })
-    }
-
-    pub(crate) fn open_pinned(
-        path: &Path,
-        lru: bool,
-    ) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-        let data = MapData::from_pin(path).map_err(|e| format!("opening pin: {e}"))?;
-        let wrapped = if lru {
-            Map::LruHashMap(data)
-        } else {
-            Map::HashMap(data)
-        };
-        BpfHashMap::try_from(wrapped).map_err(|e| format!("{e}"))
     }
 
     fn load(obj: &Path, iface: &str, ports: &[u16]) -> Result<Self, String> {
@@ -421,8 +406,10 @@ impl Blocklist {
     }
 
     fn open_pin(p: &Path) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-        Enforcer::open_pinned(p, true)
-            .or_else(|_| Enforcer::open_pinned(p, false))
+        MapData::from_pin(p)
+            .map_err(|e| format!("opening pin: {e}"))
+            .and_then(open_hash)
+            .map(|(map, _)| map)
             .map_err(|e| format!("opening {}: {e}", p.display()))
     }
 
@@ -563,15 +550,25 @@ fn read_counters(get: impl Fn(u32) -> Result<u64, MapError>) -> Result<Counters,
     })
 }
 
-/// A `hash<u32,u64>` block map by kernel id, LRU or plain, as `open_pin`
-/// accepts either from a pin.
+/// A `hash<u32,u64>` block map by kernel id, LRU or plain.
 fn open_hash_by_id(id: u32) -> Result<BpfHashMap<MapData, u32, u64>, String> {
-    let open = || MapData::from_id(id).map_err(|e| format!("opening map id {id}: {e}"));
-    if let Ok(map) = BpfHashMap::try_from(Map::LruHashMap(open()?)) {
-        return Ok(map);
-    }
-    BpfHashMap::try_from(Map::HashMap(open()?))
-        .map_err(|e| format!("map id {id} is not a hash<u32,u64>: {e}"))
+    let data = MapData::from_id(id).map_err(|e| format!("opening map id {id}: {e}"))?;
+    open_hash(data)
+        .map(|(map, _)| map)
+        .map_err(|e| format!("map id {id}: {e}"))
+}
+
+/// An open map as a `hash<u32,u64>`, LRU or plain as the kernel says it is,
+/// with its kernel id, both taken from this one open handle.
+fn open_hash(data: MapData) -> Result<(BpfHashMap<MapData, u32, u64>, u32), String> {
+    let info = data.info().map_err(|e| format!("reading map info: {e}"))?;
+    let wrapped = match info.map_type() {
+        Ok(MapType::LruHash) => Map::LruHashMap(data),
+        Ok(MapType::Hash) => Map::HashMap(data),
+        other => return Err(format!("not a hash map: {other:?}")),
+    };
+    let map = BpfHashMap::try_from(wrapped).map_err(|e| format!("not a hash<u32,u64>: {e}"))?;
+    Ok((map, info.id()))
 }
 
 /// Every IPv4 address configured on this host.
