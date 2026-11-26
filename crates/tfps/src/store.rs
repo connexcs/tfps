@@ -81,6 +81,24 @@ pub struct BlockSummary {
     pub first_seen: u32,
 }
 
+/// One row per address in `?1` (a JSON array): its newest row's reason and
+/// detail, and its newest and oldest times. Uses `block_log_ip_ts`.
+const SQL_BLOCK_SUMMARIES: &str = "SELECT ip, reason, detail, ts, first_seen FROM (
+     SELECT ip, reason, detail, ts,
+            MIN(ts) OVER (PARTITION BY ip) AS first_seen,
+            ROW_NUMBER() OVER (PARTITION BY ip ORDER BY ts DESC, rowid DESC) AS rn
+     FROM block_log
+     WHERE ip IN (SELECT value FROM json_each(?1))
+ ) WHERE rn = 1";
+
+/// The addresses in `?1` that `block_log` mentions. Uses `block_log_ip_ts`.
+const SQL_LOGGED_AMONG: &str = "SELECT DISTINCT ip FROM block_log
+     WHERE ip IN (SELECT value FROM json_each(?1))";
+
+/// The addresses in `?1` that are on the feed, by the table's primary key.
+const SQL_APIBAN_AMONG: &str =
+    "SELECT ip FROM apiban_ip WHERE ip IN (SELECT value FROM json_each(?1))";
+
 /// A set of addresses as a JSON array, for `json_each` to turn back into rows
 /// inside a query. Addresses are plain dotted quads, but serde does the quoting
 /// anyway rather than trusting that.
@@ -209,6 +227,9 @@ impl Store {
                      detail TEXT    NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS block_log_ts ON block_log (ts);
+                 -- The lookups by address (`block_summaries`, `logged_among`,
+                 -- `blocks(.., Some(ip))`) read one address's rows newest first.
+                 CREATE INDEX IF NOT EXISTS block_log_ip_ts ON block_log (ip, ts DESC);
                  -- The APIBAN feed, kept because it cannot rebuild itself from traffic.
                  -- Perimeter state normally dies with the process and is relearned in
                  -- minutes (`SPEC.md` 10); this is the exception, since the feed is
@@ -376,8 +397,8 @@ impl Store {
 
     /// Which of `among` are on the APIBAN feed.
     ///
-    /// The feed is streamed and only matches are kept, so memory follows the size
-    /// of `among` (the kernel block map), not the size of the feed.
+    /// The addresses are handed to SQLite and looked up through the table's
+    /// primary key, so neither the feed nor `among` is scanned against the other.
     pub fn apiban_among(
         &self,
         among: &std::collections::HashSet<String>,
@@ -388,16 +409,13 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare("SELECT ip FROM apiban_ip")
+            .prepare(SQL_APIBAN_AMONG)
             .map_err(|e| format!("reading apiban_ip: {e}"))?;
         let rows = st
-            .query_map([], |r| r.get::<_, String>(0))
+            .query_map([addresses_json(among)], |r| r.get::<_, String>(0))
             .map_err(|e| format!("iterating apiban_ip: {e}"))?;
         for row in rows {
-            let ip = row.map_err(|e| format!("reading apiban_ip: {e}"))?;
-            if among.contains(&ip) {
-                out.insert(ip);
-            }
+            out.insert(row.map_err(|e| format!("reading apiban_ip: {e}"))?);
         }
         Ok(out)
     }
@@ -592,15 +610,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare(
-                "SELECT ip, reason, detail, ts, first_seen FROM (
-                     SELECT ip, reason, detail, ts,
-                            MIN(ts) OVER (PARTITION BY ip) AS first_seen,
-                            ROW_NUMBER() OVER (PARTITION BY ip ORDER BY ts DESC, rowid DESC) AS rn
-                     FROM block_log
-                     WHERE ip IN (SELECT value FROM json_each(?1))
-                 ) WHERE rn = 1",
-            )
+            .prepare(SQL_BLOCK_SUMMARIES)
             .map_err(|e| format!("reading block_log: {e}"))?;
         let rows = st
             .query_map([addresses_json(among)], |r| {
@@ -636,10 +646,7 @@ impl Store {
         }
         let mut st = self
             .conn
-            .prepare(
-                "SELECT DISTINCT ip FROM block_log
-                 WHERE ip IN (SELECT value FROM json_each(?1))",
-            )
+            .prepare(SQL_LOGGED_AMONG)
             .map_err(|e| format!("reading block_log: {e}"))?;
         let rows = st
             .query_map([addresses_json(among)], |r| r.get::<_, String>(0))
@@ -871,6 +878,35 @@ mod tests {
             s.logged_among(&among).unwrap(),
             [a.to_string(), b.to_string()].into_iter().collect()
         );
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// The address lookups go through an index, not a scan of the whole table:
+    /// `block_log_ip_ts` for the audit log, the primary key for the feed.
+    #[test]
+    fn address_lookups_use_an_index_not_a_table_scan() {
+        let p = tmp();
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).expect("open");
+        let plan = |sql: &str| -> String {
+            let mut st = s
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("explain");
+            let rows = st
+                .query_map(["[\"203.0.113.1\"]"], |r| r.get::<_, String>(3))
+                .expect("plan rows");
+            rows.flatten().collect::<Vec<_>>().join(" | ")
+        };
+        for sql in [SQL_BLOCK_SUMMARIES, SQL_LOGGED_AMONG] {
+            let used = plan(sql);
+            assert!(used.contains("block_log_ip_ts"), "{used}");
+            assert!(!used.contains("SCAN block_log"), "{used}");
+        }
+        let used = plan(SQL_APIBAN_AMONG);
+        assert!(!used.contains("SCAN apiban_ip"), "{used}");
+        assert!(used.contains("apiban_ip USING"), "{used}");
         drop(s);
         let _ = std::fs::remove_file(&p);
     }
