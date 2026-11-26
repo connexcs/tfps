@@ -91,7 +91,7 @@ fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {
 /// Never fails: a map that will not open reads as `"inactive"`, and an
 /// unreadable database nulls the learned totals, as `StatusDoc` describes.
 pub fn status_docs(ctx: &Ctx) -> StatusDoc {
-    let blocked = open_blocklist(ctx).map(|b| (b.entries().len(), b.source));
+    let blocked = open_blocklist(ctx).and_then(|b| Ok((b.entries()?.len(), b.source)));
     let totals = Store::open_readonly(&ctx.db).and_then(|s| s.totals()).ok();
     status_doc(blocked, totals, &ctx.db, env!("CARGO_PKG_VERSION"))
 }
@@ -113,13 +113,15 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
     // even be opened would conclude nothing is blocked, the exact wrong
     // reading this null is here to prevent. The audit log and the feed are
     // asked only about the addresses in the map.
-    let condemnation = open_blocklist(ctx).ok().map(|b| {
-        let entries = b.entries();
-        let among = map_addresses(&entries);
-        let audit = s.logged_among(&among).unwrap_or_default();
-        let apiban = s.apiban_among(&among).unwrap_or_default();
-        condemnation_counts(&entries, &audit, &apiban)
-    });
+    let condemnation = open_blocklist(ctx)
+        .and_then(|b| b.entries())
+        .ok()
+        .map(|entries| {
+            let among = map_addresses(&entries);
+            let audit = s.logged_among(&among).unwrap_or_default();
+            let apiban = s.apiban_among(&among).unwrap_or_default();
+            condemnation_counts(&entries, &audit, &apiban)
+        });
     let now = now();
     let stats_line = s.meta_get("stats");
     let stats_ts = s.meta_get("stats_ts").and_then(|t| t.parse::<u32>().ok());
@@ -161,7 +163,7 @@ pub fn stats_docs(ctx: &Ctx) -> Result<StatsDoc, String> {
 /// manual record leaves rows unattributed rather than failing the listing:
 /// the blocks themselves are still the kernel's to report.
 pub fn banned_docs(ctx: &Ctx) -> Result<Vec<BannedDoc>, String> {
-    let entries = open_blocklist(ctx)?.entries();
+    let entries = open_blocklist(ctx)?.entries()?;
     Ok(attribute_entries(ctx, &entries))
 }
 
@@ -239,7 +241,7 @@ pub fn log_docs(ctx: &Ctx, limit: usize, ip: Option<&str>) -> Result<Vec<LogDoc>
 /// `/metrics`: the map is the state of the system, and counting it reads no
 /// database and moves no address anywhere.
 pub fn map_counts(ctx: &Ctx) -> Result<(usize, usize), String> {
-    let entries = open_blocklist(ctx)?.entries();
+    let entries = open_blocklist(ctx)?.entries()?;
     let permanent = entries.iter().filter(|(_, until)| *until == 0).count();
     Ok((entries.len(), permanent))
 }
@@ -328,7 +330,10 @@ pub fn unban_docs(
     let mut b = open_blocklist(ctx)?;
     // A listing taken moments earlier is not a guarantee about now, so `--all`
     // reports what `remove` says was actually there, like the address form.
-    let ips = ips.unwrap_or_else(|| b.entries().into_iter().map(|(ip, _)| ip).collect());
+    let ips = match ips {
+        Some(ips) => ips,
+        None => b.entries()?.into_iter().map(|(ip, _)| ip).collect(),
+    };
     let (removed, failed) = remove_each(&ips, |ip| b.remove(ip));
     record_manual(ctx, &manual_unbans(&removed, source, reason, now()));
     let docs = removed

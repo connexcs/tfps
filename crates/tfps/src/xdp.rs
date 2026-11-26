@@ -396,16 +396,14 @@ impl Blocklist {
     }
 
     /// Every condemned source, with the instant its block expires in monotonic ns
-    /// (`0` = never).
-    pub fn entries(&self) -> Vec<(Ipv4Addr, u64)> {
-        let mut out: Vec<(Ipv4Addr, u64)> = self
-            .map
-            .keys()
-            .filter_map(Result::ok)
-            .map(|k| (self.addr(k), self.map.get(&k, 0).unwrap_or(0)))
-            .collect();
-        out.sort_by_key(|(ip, _)| *ip);
-        out
+    /// (`0` = never), sorted by address.
+    ///
+    /// A key that disappears between being listed and being read (its block
+    /// expired or was lifted in between) is left out: it is no longer blocked. Any
+    /// other failure is an error. It is never turned into an expiry of `0`, which
+    /// would report the address as permanently blocked.
+    pub fn entries(&self) -> Result<Vec<(Ipv4Addr, u64)>, String> {
+        collect_entries(self.map.keys(), |k| self.map.get(&k, 0), |k| self.addr(k))
     }
 
     /// One address's entry: `Some(until)` when it is blocked (`0` = no expiry),
@@ -516,6 +514,26 @@ pub fn default_interface() -> Option<String> {
     None
 }
 
+/// The body of `Blocklist::entries`, apart from the map, so the rules are
+/// testable without a kernel: a key deleted between listing and lookup is
+/// skipped, and every other error, while listing or while reading, is returned.
+fn collect_entries(
+    keys: impl Iterator<Item = Result<u32, MapError>>,
+    get: impl Fn(u32) -> Result<u64, MapError>,
+    addr: impl Fn(u32) -> Ipv4Addr,
+) -> Result<Vec<(Ipv4Addr, u64)>, String> {
+    let mut out = Vec::new();
+    for key in keys {
+        let key = key.map_err(|e| format!("listing the block map: {e}"))?;
+        let ip = addr(key);
+        if let Some(until) = lookup_result(get(key), ip)? {
+            out.push((ip, until));
+        }
+    }
+    out.sort_by_key(|(ip, _)| *ip);
+    Ok(out)
+}
+
 /// A map lookup's answer: the value, `None` for a key that is not there, and an
 /// error for anything else.
 fn lookup_result(r: Result<u64, MapError>, ip: Ipv4Addr) -> Result<Option<u64>, String> {
@@ -529,6 +547,45 @@ fn lookup_result(r: Result<u64, MapError>, ip: Ipv4Addr) -> Result<Option<u64>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_key_deleted_mid_listing_is_skipped_and_never_reads_as_permanent() {
+        let addr = |k: u32| Ipv4Addr::from(k);
+        let keys = || [1u32, 2, 3].map(Ok).into_iter();
+        let got = collect_entries(
+            keys(),
+            |k| match k {
+                2 => Err(MapError::KeyNotFound),
+                _ => Ok(u64::from(k) * 10),
+            },
+            addr,
+        )
+        .expect("a vanished key is not an error");
+        assert_eq!(got, [(addr(1), 10), (addr(3), 30)], "no (addr(2), 0) entry");
+    }
+
+    #[test]
+    fn any_other_map_error_fails_the_listing() {
+        let addr = |k: u32| Ipv4Addr::from(k);
+        let err = collect_entries(
+            [1u32, 2].map(Ok).into_iter(),
+            |k| {
+                if k == 2 {
+                    Err(MapError::ElementNotFound)
+                } else {
+                    Ok(0)
+                }
+            },
+            addr,
+        );
+        assert!(err.is_err(), "a lookup failure is reported");
+        let err = collect_entries(
+            [Ok(1u32), Err(MapError::KeyNotFound)].into_iter(),
+            |_| Ok(0),
+            addr,
+        );
+        assert!(err.is_err(), "a listing failure is reported");
+    }
 
     #[test]
     fn only_a_missing_key_reads_as_not_blocked() {

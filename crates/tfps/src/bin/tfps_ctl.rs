@@ -270,11 +270,10 @@ fn status(args: &Args) -> Result<(), String> {
         }
         Err(e) => say!("learned state     : unavailable — {e}"),
     }
-    match Blocklist::open(args.map.as_deref()) {
-        Ok(b) => {
-            let e = b.entries();
+    match Blocklist::open(args.map.as_deref()).and_then(|b| Ok((b.entries()?, b.source))) {
+        Ok((e, source)) => {
             let permanent = e.iter().filter(|(_, until)| *until == 0).count();
-            say!("enforcement       : {}", b.source);
+            say!("enforcement       : {source}");
             say!(
                 "blocked now       : {} ({permanent} without expiry)",
                 e.len()
@@ -317,8 +316,7 @@ fn stats(args: &Args) -> Result<(), String> {
         Err(e) => say!("KERNEL  (live)\n  unavailable — {e}"),
     }
     let s = Store::open_readonly(&args.db)?;
-    if let Ok(b) = Blocklist::open(args.map.as_deref()) {
-        let e = b.entries();
+    if let Ok(e) = Blocklist::open(args.map.as_deref()).and_then(|b| b.entries()) {
         // A perimeter block often lands on an IP that is also on the feed; attribute it to the
         // reason we condemned it (the audit log), not to the feed it happens to appear on.
         // Both are asked only about the addresses in the map.
@@ -469,8 +467,7 @@ fn banned(args: &Args) -> Result<(), String> {
         }
         return Ok(());
     }
-    let b = Blocklist::open(args.map.as_deref())?;
-    let entries = b.entries();
+    let entries = Blocklist::open(args.map.as_deref())?.entries()?;
     if entries.is_empty() {
         say!("nothing is blocked");
         return Ok(());

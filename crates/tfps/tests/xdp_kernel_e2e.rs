@@ -21,7 +21,7 @@ fn a_block_reaches_the_kernel_map_and_can_be_lifted() {
     assert_eq!(enforcer.blocked_count(), 1, "one source is condemned");
 
     let mut live = Blocklist::open(None).expect("open the live map");
-    let entries = live.entries();
+    let entries = live.entries().expect("list the live map");
     assert!(
         entries.iter().any(|(candidate, _)| *candidate == ip),
         "the block is visible from the live map: {entries:?}"
@@ -31,7 +31,11 @@ fn a_block_reaches_the_kernel_map_and_can_be_lifted() {
         "the source was there"
     );
     assert!(
-        !live.entries().iter().any(|(candidate, _)| *candidate == ip),
+        !live
+            .entries()
+            .expect("list the live map")
+            .iter()
+            .any(|(candidate, _)| *candidate == ip),
         "the source is gone after unban"
     );
 }
