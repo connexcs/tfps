@@ -12,6 +12,7 @@ pub mod apiban;
 pub mod config;
 pub mod ctl;
 pub mod guard;
+pub mod hooks;
 pub mod manual_log;
 pub mod state;
 pub mod store;

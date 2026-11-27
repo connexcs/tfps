@@ -1,0 +1,51 @@
+# Checks every pull request and every push to master: formatting, lints, tests, and
+# the static musl release build the installer ships, with its binary sizes reported
+# in the job summary so a change in size is visible on the PR.
+#
+# The release workflow (release.yml) runs the same gate and build when a version tag
+# is pushed; this one runs them before a change is merged.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: musl toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace
+
+      - name: musl release build
+        run: cargo build --locked --release --target x86_64-unknown-linux-musl
+
+      - name: binary sizes
+        run: |
+          {
+            echo "### Release binaries (x86_64-unknown-linux-musl)"
+            echo
+            echo "| binary | bytes |"
+            echo "|---|---|"
+            for b in tfps tfps_ctl; do
+              echo "| $b | $(stat -c %s target/x86_64-unknown-linux-musl/release/$b) |"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -160,6 +160,88 @@ pub fn read_all(dir: &Path) -> (Vec<ManualAction>, usize) {
     (actions, unreadable)
 }
 
+/// Where reading the record left off: a month file's name and a byte offset in
+/// it. Kept by the webhook sender so it reads each action once, across restarts.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position {
+    /// The month file's name, such as `manual_actions-202611.jsonl`; empty
+    /// before the record has any file.
+    pub file: String,
+    /// Bytes of that file already read, always at a line boundary.
+    pub offset: u64,
+}
+
+/// The current end of the record, where a reader that should see only new
+/// actions starts.
+#[must_use]
+pub fn end_position(dir: &Path) -> Position {
+    let mut files = month_files(dir);
+    files.sort();
+    match files.last() {
+        Some((_, path)) => Position {
+            file: file_name(path),
+            offset: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        },
+        None => Position::default(),
+    }
+}
+
+/// The actions appended since `from`, oldest first, the position after them,
+/// and how many lines could not be read.
+///
+/// Only whole lines are taken: a line still being written is left for the
+/// next call. A later month's file is read from its start once the current one
+/// is done. A file shorter than `from.offset` was replaced, and is read again
+/// from its start.
+#[must_use]
+pub fn read_after(dir: &Path, from: &Position) -> (Vec<ManualAction>, Position, usize) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut files = month_files(dir);
+    files.sort();
+    let mut pos = from.clone();
+    let mut actions = Vec::new();
+    let mut unreadable = 0;
+    for (_, path) in files {
+        let name = file_name(&path);
+        if !pos.file.is_empty() && name < pos.file {
+            continue; // an earlier month, already read
+        }
+        let start = if name == pos.file { pos.offset } else { 0 };
+        let Ok(mut f) = std::fs::File::open(&path) else {
+            unreadable += 1;
+            continue;
+        };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let start = if len < start { 0 } else { start };
+        let mut bytes = Vec::new();
+        if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut bytes).is_err() {
+            unreadable += 1;
+            continue;
+        }
+        let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        for line in String::from_utf8_lossy(&bytes[..whole])
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+        {
+            match serde_json::from_str::<ManualAction>(line) {
+                Ok(a) => actions.push(a),
+                Err(_) => unreadable += 1,
+            }
+        }
+        pos = Position {
+            file: name,
+            offset: start + whole as u64,
+        };
+    }
+    (actions, pos, unreadable)
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
 /// The latest action per address, by time.
 #[must_use]
 pub fn latest_by_ip(actions: &[ManualAction]) -> HashMap<String, ManualAction> {
@@ -473,6 +555,61 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn action(ts: u32, verb: ManualVerb, last: u8) -> ManualAction {
+        ManualAction {
+            ts,
+            verb,
+            ip: std::net::Ipv4Addr::new(203, 0, 113, last),
+            source: "operator".into(),
+            reason: None,
+            expires: None,
+        }
+    }
+
+    #[test]
+    fn the_record_is_read_onwards_from_where_it_left_off() {
+        let dir = std::env::temp_dir().join(format!("tfps-manual-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(end_position(&dir), Position::default());
+        let nov = 1_795_000_000; // 2026-11
+        append(&dir, &[action(nov, ManualVerb::Ban, 1)], 0o600).unwrap();
+        let start = end_position(&dir);
+        append(&dir, &[action(nov + 1, ManualVerb::Unban, 1)], 0o600).unwrap();
+        let (got, pos, bad) = read_after(&dir, &start);
+        assert_eq!((got.len(), bad), (1, 0), "only what came after the start");
+        assert_eq!(got[0].verb, ManualVerb::Unban);
+        let (again, pos2, _) = read_after(&dir, &pos);
+        assert!(again.is_empty(), "nothing is read twice");
+        assert_eq!(pos2, pos);
+
+        // A line still being written is left for next time.
+        let file = dir.join(&pos.file);
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&file)
+            .unwrap();
+        std::io::Write::write_all(&mut f, br#"{"ts":1795000002,"action":"ban""#).unwrap();
+        let (partial, pos3, bad) = read_after(&dir, &pos);
+        assert!(partial.is_empty() && bad == 0, "half a line is not read");
+        assert_eq!(pos3, pos);
+        std::io::Write::write_all(
+            &mut f,
+            b",\"ip\":\"203.0.113.2\",\"source\":\"x\",\"reason\":null,\"expires\":null}\n",
+        )
+        .unwrap();
+        let (done, pos4, _) = read_after(&dir, &pos3);
+        assert_eq!(done.len(), 1, "read once complete");
+
+        // The next month's file is read from its start.
+        let dec = 1_797_000_000; // 2026-12
+        append(&dir, &[action(dec, ManualVerb::Ban, 3)], 0o600).unwrap();
+        let (next, pos5, _) = read_after(&dir, &pos4);
+        assert_eq!(next.len(), 1);
+        assert_ne!(pos5.file, pos4.file, "moved on to December");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn dates_round_trip_across_years_and_leap_days() {

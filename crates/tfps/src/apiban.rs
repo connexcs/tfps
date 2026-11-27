@@ -124,14 +124,7 @@ fn fetch(key: &str, id: &str) -> Result<Batch, String> {
     // A 4xx is returned, not raised: APIBAN answers "no new bans" with status 400, and
     // treating that as an error turned every quiet poll into a WARNING (one per five
     // minutes, two thousand a week on a real host). `received` decides what a status means.
-    let agent = ureq::Agent::with_parts(
-        ureq::config::Config::builder()
-            .timeout_global(Some(Duration::from_secs(20)))
-            .http_status_as_error(false)
-            .build(),
-        ureq::unversioned::transport::DefaultConnector::default(),
-        MuslSafeResolver,
-    );
+    let agent = agent(Duration::from_secs(20));
     let mut response = agent.get(&url).call().map_err(|e| format!("{e}"))?;
     let status = response.status().as_u16();
     let body = response
@@ -166,6 +159,20 @@ fn received(status: u16, body: &str) -> Result<Batch, String> {
             Err(format!("http status: {status}, body: {head:?}"))
         }
     }
+}
+
+/// An HTTP agent whose DNS does not go through the C library (see `fetch`), with
+/// `timeout` over each whole call, and statuses returned rather than raised.
+/// Shared with the webhook sender, which has the same static-musl constraints.
+pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::Agent::with_parts(
+        ureq::config::Config::builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .build(),
+        ureq::unversioned::transport::DefaultConnector::default(),
+        MuslSafeResolver,
+    )
 }
 
 /// A resolver that does its own DNS, independent of the C library's `getaddrinfo`.

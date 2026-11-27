@@ -83,6 +83,10 @@ pub trait Backend: Send + Sync {
     fn map_counts(&self) -> Result<(usize, usize), String>;
     /// The counts `/metrics` reads from SQLite. No addresses.
     fn db_counts(&self) -> Result<DbCounts, String>;
+    /// Webhook delivery outcomes, `(url index, result, count)`; empty with no hooks.
+    fn hook_deliveries(&self) -> Vec<(usize, &'static str, u64)> {
+        Vec::new()
+    }
     /// Lift these already-validated addresses. `Err` means nothing was touched.
     fn unban(
         &self,
@@ -92,8 +96,9 @@ pub trait Backend: Send + Sync {
     ) -> Result<UnbanOutcome, String>;
 }
 
-/// The real thing: every answer is the matching `tfps_ctl --json` document.
-pub struct CtlBackend(pub Ctx);
+/// The real thing: every answer is the matching `tfps_ctl --json` document. The
+/// second field is the webhook sender's delivery counts, when hooks are on.
+pub struct CtlBackend(pub Ctx, pub Option<Arc<crate::hooks::Stats>>);
 
 impl Backend for CtlBackend {
     fn status(&self) -> StatusDoc {
@@ -119,6 +124,9 @@ impl Backend for CtlBackend {
     }
     fn db_counts(&self) -> Result<DbCounts, String> {
         crate::ctl::db_counts(&self.0)
+    }
+    fn hook_deliveries(&self) -> Vec<(usize, &'static str, u64)> {
+        self.1.as_ref().map(|s| s.snapshot()).unwrap_or_default()
     }
     fn unban(
         &self,
@@ -867,6 +875,7 @@ fn metrics(backend: &dyn Backend) -> String {
         kernel: backend.kernel_counters(),
         blocked: backend.map_counts().ok(),
         db: backend.db_counts().ok(),
+        hooks: backend.hook_deliveries(),
         now: crate::ctl::now(),
         version: env!("CARGO_PKG_VERSION"),
     })
@@ -880,6 +889,8 @@ pub struct MetricInputs<'a> {
     pub blocked: Option<(usize, usize)>,
     /// Counts from SQLite.
     pub db: Option<DbCounts>,
+    /// Webhook delivery outcomes, `(url index, result, count)`.
+    pub hooks: Vec<(usize, &'static str, u64)>,
     /// For turning the checkpoint's age into a timestamp.
     pub now: u32,
     pub version: &'a str,
@@ -1008,6 +1019,22 @@ pub fn render_metrics(m: &MetricInputs<'_>) -> String {
             family(name, "gauge", help, &one(v.to_string()));
         }
     }
+    let samples: Vec<_> = m
+        .hooks
+        .iter()
+        .map(|(i, result, n)| {
+            (
+                labels(&[("url_index", &i.to_string()), ("result", result)]),
+                n.to_string(),
+            )
+        })
+        .collect();
+    family(
+        "tfps_hook_deliveries_total",
+        "counter",
+        "Webhook events by URL (its index in the hooks list) and outcome.",
+        &samples,
+    );
     out
 }
 
@@ -1982,6 +2009,62 @@ mod tests {
 
     /// Counts only: `/metrics` never builds the block listing, the stats
     /// document or the log, which are the reads that carry addresses.
+    #[test]
+    fn hook_deliveries_are_exported_per_url_and_result() {
+        struct WithHooks;
+        impl Backend for WithHooks {
+            fn status(&self) -> StatusDoc {
+                up().status()
+            }
+            fn stats(&self) -> Result<StatsDoc, String> {
+                Err("x".into())
+            }
+            fn banned(&self) -> Result<Vec<BannedDoc>, String> {
+                Err("x".into())
+            }
+            fn banned_one(&self, _: Ipv4Addr) -> Result<Option<BannedDoc>, String> {
+                Err("x".into())
+            }
+            fn log(&self, _: usize, _: Option<&str>) -> Result<Vec<LogDoc>, String> {
+                Err("x".into())
+            }
+            fn kernel_counters(&self) -> Option<(u64, u64, u64)> {
+                None
+            }
+            fn map_counts(&self) -> Result<(usize, usize), String> {
+                Err("x".into())
+            }
+            fn db_counts(&self) -> Result<DbCounts, String> {
+                Err("x".into())
+            }
+            fn unban(
+                &self,
+                _: &[String],
+                _: &str,
+                _: Option<&str>,
+            ) -> Result<UnbanOutcome, String> {
+                Err("x".into())
+            }
+            fn hook_deliveries(&self) -> Vec<(usize, &'static str, u64)> {
+                vec![(0, "delivered", 7), (0, "failed", 1), (1, "queue_full", 2)]
+            }
+        }
+        let m = parse_prometheus(&route(&get("/metrics"), &WithHooks, &off()).body);
+        assert_eq!(
+            m[r#"tfps_hook_deliveries_total{url_index="0",result="delivered"}"#],
+            7.0
+        );
+        assert_eq!(
+            m[r#"tfps_hook_deliveries_total{url_index="1",result="queue_full"}"#],
+            2.0
+        );
+        let plain = route(&get("/metrics"), &up(), &off()).body;
+        assert!(
+            !plain.contains("tfps_hook_deliveries_total"),
+            "no hooks, no family"
+        );
+    }
+
     #[test]
     fn metrics_read_counts_and_never_addresses() {
         let body = fn_body("metrics");

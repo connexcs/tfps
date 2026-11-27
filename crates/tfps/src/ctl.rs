@@ -86,6 +86,12 @@ pub fn kernel_counters(ctx: &Ctx) -> Option<(u64, u64, u64)> {
     Some((c.seen, c.dropped, c.expired))
 }
 
+/// Every entry in the block map `ctx` names, as `(address, expiry in monotonic
+/// ns, 0 = none)`. For the webhook sender, which watches the map for expiries.
+pub fn map_entries(ctx: &Ctx) -> Result<Vec<(Ipv4Addr, u64)>, String> {
+    open_blocklist(ctx)?.entries()
+}
+
 /// The block map `ctx` names: an explicit pin as given, else the map the
 /// daemon's state file names, else the usual lookup.
 fn open_blocklist(ctx: &Ctx) -> Result<Blocklist, String> {

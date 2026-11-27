@@ -660,6 +660,52 @@ impl Store {
         Ok(out)
     }
 
+    /// Up to `limit` `block_log` rows written after row `after`, oldest first,
+    /// each with its row number: how the webhook sender reads new blocks without
+    /// rereading old ones.
+    pub fn block_log_after(
+        &self,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, BlockRow)>, String> {
+        let mut st = self
+            .conn
+            .prepare(
+                "SELECT rowid, ts, ip, reason, detail FROM block_log
+                 WHERE rowid > ?1 ORDER BY rowid LIMIT ?2",
+            )
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let rows = st
+            .query_map(params![after, limit as i64], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    BlockRow {
+                        ts: r.get(1)?,
+                        ip: r.get(2)?,
+                        reason: r.get(3)?,
+                        detail: r.get(4)?,
+                    },
+                ))
+            })
+            .map_err(|e| format!("iterating block_log: {e}"))?;
+        rows.map(|r| r.map_err(|e| format!("reading block_log: {e}")))
+            .collect()
+    }
+
+    /// The newest `block_log` row number and its time, or `(0, 0)` when empty.
+    pub fn block_log_end(&self) -> Result<(i64, u32), String> {
+        self.conn
+            .query_row(
+                "SELECT rowid, ts FROM block_log ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, u32>(1)?)),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok((0, 0)),
+                e => Err(format!("reading block_log: {e}")),
+            })
+    }
+
     /// How many blocks happened since `ts`, grouped by reason. The shape of what the
     /// perimeter is actually catching, which one line of the periodic report cannot show.
     pub fn blocks_by_reason(&self, since: u32) -> Result<Vec<(String, u32)>, String> {
@@ -907,6 +953,39 @@ mod tests {
         let used = plan(SQL_APIBAN_AMONG);
         assert!(!used.contains("SCAN apiban_ip"), "{used}");
         assert!(used.contains("apiban_ip USING"), "{used}");
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn block_log_is_read_onwards_from_a_row_number() {
+        let p = tmp();
+        let _ = std::fs::remove_file(&p);
+        let s = Store::open(&p).expect("open");
+        assert_eq!(s.block_log_end().unwrap(), (0, 0));
+        for (i, ts) in [100u32, 200, 300].iter().enumerate() {
+            s.log_block(
+                *ts,
+                std::net::Ipv4Addr::new(203, 0, 113, i as u8 + 1),
+                "scanner",
+                "x",
+            )
+            .unwrap();
+        }
+        let (end, ts) = s.block_log_end().unwrap();
+        assert_eq!(ts, 300);
+        let all = s.block_log_after(0, 100).unwrap();
+        assert_eq!(
+            all.iter().map(|(_, r)| r.ts).collect::<Vec<_>>(),
+            [100, 200, 300]
+        );
+        let rest = s.block_log_after(all[0].0, 100).unwrap();
+        assert_eq!(rest.len(), 2, "after the first row");
+        assert_eq!(s.block_log_after(all[0].0, 1).unwrap().len(), 1, "limit");
+        assert!(
+            s.block_log_after(end, 100).unwrap().is_empty(),
+            "nothing new"
+        );
         drop(s);
         let _ = std::fs::remove_file(&p);
     }

@@ -4,8 +4,10 @@ Documentation=https://github.com/sippulse/tfps#json-api
 After=tfps.service
 
 # Installed but not enabled. It serves nothing until /etc/tfps/config.json has
-# "http": {"enabled": true}; without that it says so and exits 0, so enabling it
-# early is harmless. Turn it on with:  systemctl enable --now tfps-api
+# "http": {"enabled": true} or webhook URLs in "hooks"; without either it says so
+# and exits 0, so enabling it early is harmless. Turn it on with:
+#   systemctl enable --now tfps-api
+# Webhooks keep their place in /var/lib/tfps/hooks.cursor (the state directory).
 #
 # The "http" section is read at start only. After editing it, including to turn
 # the API off, run:  systemctl restart tfps-api
