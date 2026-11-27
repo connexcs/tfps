@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>TFPS dashboard</title>
+<link rel="stylesheet" href="/dashboard.css">
+</head>
+<body>
+<header class="bar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">◆</span>
+    <span class="name">TFPS</span>
+    <span class="host" id="host"></span>
+  </div>
+  <div class="state">
+    <span class="badge" id="enforcement">…</span>
+    <span class="muted" id="version"></span>
+    <span class="muted" id="updated"></span>
+    <button type="button" id="pause" class="ghost">Pause</button>
+    <button type="button" id="refresh" class="ghost">Refresh</button>
+  </div>
+</header>
+
+<main>
+  <section id="auth" class="card notice" hidden>
+    <h2>This API needs a token</h2>
+    <p>The server was started with <code>token_file</code>. Enter the token to read it. It is kept in
+      this tab only (session storage) and sent as <code>Authorization: Bearer</code>.</p>
+    <form id="auth-form" autocomplete="off">
+      <input id="token" type="password" placeholder="API token" aria-label="API token" required>
+      <button type="submit">Use token</button>
+    </form>
+    <p class="error" id="auth-error" hidden></p>
+  </section>
+
+  <section class="kpis" aria-label="Summary">
+    <div class="card kpi"><span class="label">Blocked now</span><span class="value" id="k-blocked">–</span><span class="sub" id="k-blocked-sub"></span></div>
+    <div class="card kpi"><span class="label">Dropped by XDP</span><span class="value" id="k-dropped">–</span><span class="sub" id="k-dropped-sub"></span></div>
+    <div class="card kpi"><span class="label">Blocks, last 24 h</span><span class="value" id="k-day">–</span><span class="sub" id="k-day-sub"></span></div>
+    <div class="card kpi"><span class="label">APIBAN feed</span><span class="value" id="k-feed">–</span><span class="sub" id="k-feed-sub"></span></div>
+    <div class="card kpi"><span class="label">Daemon running for</span><span class="value" id="k-up">–</span><span class="sub" id="k-up-sub"></span></div>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="h-reasons">
+      <div class="card-head">
+        <h2 id="h-reasons">Blocks by reason</h2>
+        <div class="tabs" role="tablist" id="windows">
+          <button type="button" role="tab" data-window="last_hour">1 h</button>
+          <button type="button" role="tab" data-window="last_day" aria-selected="true">24 h</button>
+          <button type="button" role="tab" data-window="last_week">7 d</button>
+        </div>
+      </div>
+      <div id="reasons" class="bars"></div>
+      <p class="error" id="stats-error" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="h-traffic">
+      <div class="card-head">
+        <h2 id="h-traffic">Traffic</h2>
+        <span class="muted" id="traffic-age"></span>
+      </div>
+      <dl id="traffic" class="counters"></dl>
+    </section>
+  </div>
+
+  <section class="card" aria-labelledby="h-blocks">
+    <div class="card-head">
+      <h2 id="h-blocks">Current blocks</h2>
+      <div class="tools">
+        <input id="filter" type="search" placeholder="Filter by address, reason or detail" aria-label="Filter current blocks">
+        <span class="muted" id="blocks-count"></span>
+      </div>
+    </div>
+    <div class="table-wrap scroll">
+      <table>
+        <thead><tr><th>Address</th><th>Reason</th><th>Detail</th><th>First seen</th><th>Expires</th></tr></thead>
+        <tbody id="blocks"></tbody>
+      </table>
+    </div>
+    <p class="error" id="blocks-error" hidden></p>
+  </section>
+
+  <div class="grid">
+    <section class="card" aria-labelledby="h-log">
+      <div class="card-head"><h2 id="h-log">Recent blocks</h2><span class="muted">audit log, newest first</span></div>
+      <div class="table-wrap scroll">
+        <table>
+          <thead><tr><th>When</th><th>Address</th><th>Reason</th><th>Detail</th></tr></thead>
+          <tbody id="log"></tbody>
+        </table>
+      </div>
+      <p class="error" id="log-error" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="h-status">
+      <div class="card-head"><h2 id="h-status">Status</h2></div>
+      <dl id="status" class="facts"></dl>
+      <h3>Exempt (ignoreip)</h3>
+      <dl id="ignoreip" class="facts"></dl>
+    </section>
+  </div>
+</main>
+
+<footer class="muted">Read-only view of this host's <code>/v1</code> API. Refreshes every 10 s; the block list every 30 s.</footer>
+<script src="/dashboard.js"></script>
+</body>
+</html>

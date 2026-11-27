@@ -605,6 +605,7 @@ services, so the API can be stopped or upgraded without touching enforcement.
 | GET | `/v1/log?limit=N&ip=IP` | the block audit log, newest first (`limit` 1–1000, default 50) |
 | POST | `/v1/unban` | body `{"ips":["…"],"source":"…","reason":"…"}`; only with `allow_unban` |
 | GET | `/metrics` | Prometheus text format |
+| GET | `/` | the dashboard (below), with `/dashboard.css` and `/dashboard.js` |
 
 Every document is exactly what the matching `tfps_ctl … --json` prints, and keeps its
 null-not-zero rule: an unreadable database is `null`, never `0`. Errors are
@@ -642,6 +643,37 @@ names a process that is gone) or enforcement is inactive, the block routes answe
 so. `/v1/status` takes the XDP attach mode and interface from the same file, and the
 `tfps_xdp_*` metrics read the counters map it names; with a shared map those counters are its
 owner's, and they are left out.
+
+### Dashboard
+
+The same server answers `GET /` with a small read-only dashboard: open
+`http://127.0.0.1:9060/` (or the address you serve on) in a browser. It is one HTML page, a
+stylesheet and a script built into `tfps_ctl`, with no framework and nothing loaded from
+another site. The page holds no data: its script reads `/v1/status`, `/v1/stats` and
+`/v1/log` every 10 seconds and `/v1/blocks` every 30, like any other client.
+
+![The TFPS dashboard](docs/assets/dashboard-light.png)
+
+It shows what is blocked now (and how much is ours versus the APIBAN feed), what XDP has
+dropped, blocks by reason over the last hour, day or week, the daemon's traffic counters
+(including the HEP ones), the current block list with a filter (the first 500 rows), the
+newest rows of the audit log, the enforcement status and the `ignoreip` hits. It follows the
+browser's light or dark setting and fits a phone.
+
+- **Read-only.** There is no unban button: the API refuses requests from web pages
+  that carry an `Origin` header, which every browser `POST` does, and that rule is unchanged.
+  Same-origin `GET`s carry none, which is why the page can read.
+- **With `token_file` set,** the page loads without the token (it holds nothing) and asks
+  for it; the token is kept in that browser tab only (session storage) and sent as
+  `Authorization: Bearer`. Every data route still needs it.
+- **The `Host` check applies to the page as to everything else**, so open it by an address
+  the API answers to (behind a proxy, add the proxy's name to `hosts`).
+- The page is sent with a strict `Content-Security-Policy` (its own script and stylesheet
+  only, no inline code, requests only to this API, no framing), and the script writes every
+  value as text, never as HTML: block details are often attacker-chosen SIP text.
+
+To try it without a running daemon: `cargo run -p tfps --example dashboard_demo`, then open
+`http://127.0.0.1:19060/` (invented data).
 
 ### Security model — read this before exposing it
 
