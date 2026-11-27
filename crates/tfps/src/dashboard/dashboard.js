@@ -12,6 +12,11 @@ const TOKEN_KEY = "tfps-token";
 
 let paused = false;
 let tick = 0;
+// Each refresh takes the next generation; only the newest may change the page,
+// so a slow batch that finishes after a newer one (or after a token is entered)
+// is dropped instead of overwriting it or reopening the token prompt.
+let generation = 0;
+let inFlight = false;
 let windowName = "last_day";
 let lastStats = null;
 let lastBlocks = [];
@@ -265,11 +270,22 @@ function needToken(on, message) {
 }
 
 async function refresh() {
+  const gen = ++generation;
+  inFlight = true;
+  try {
+    await refreshAs(gen);
+  } finally {
+    if (gen === generation) inFlight = false;
+  }
+}
+
+async function refreshAs(gen) {
   const withBlocks = tick % BLOCKS_EVERY === 0;
   tick++;
   const jobs = [api("/v1/status"), api("/v1/stats"), api("/v1/log?limit=50")];
   if (withBlocks) jobs.push(api("/v1/blocks"));
   const [status, stats, log, blocks] = await Promise.allSettled(jobs);
+  if (gen !== generation) return; // superseded by a newer refresh
   const results = [status, stats, log, blocks].filter(Boolean);
   if (results.some((r) => r.status === "rejected" && r.reason instanceof AuthError)) {
     needToken(true);
@@ -334,7 +350,9 @@ function start() {
   });
   refresh();
   setInterval(() => {
-    if (!paused) refresh();
+    // A timer tick waits for the batch in flight; Refresh and a new token
+    // start a newer one, which supersedes it.
+    if (!paused && !inFlight) refresh();
   }, REFRESH_MS);
   setInterval(showUpdated, 1000);
 }
