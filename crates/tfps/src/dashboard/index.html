@@ -39,9 +39,12 @@
     <h2>The proxy in front of this API refused the request</h2>
     <p>A server between this browser and TFPS (HAProxy, nginx, Caddy…) answered
       <code>401</code> and asked for its own login, not TFPS's token. Reload the page to log in
-      to it again. If TFPS also has a <code>token_file</code>, the proxy must pass TFPS's
-      <code>Authorization: Bearer</code> header on, or leave <code>token_file</code> unset and
-      let the proxy's login guard the API.</p>
+      to it again.</p>
+    <p>A browser sends one <code>Authorization</code> header, so a TFPS token entered here
+      replaces the proxy's password login (HTTP Basic). Either leave TFPS's
+      <code>token_file</code> unset and let the proxy's login guard the API, or keep both by
+      having the proxy authenticate some other way (a client certificate or a login cookie)
+      and pass the <code>Authorization: Bearer</code> header on to TFPS.</p>
   </section>
 
   <section class="kpis" aria-label="Summary">
