@@ -303,10 +303,13 @@ impl Default for Retry {
     }
 }
 
-/// Delivery outcomes per URL, for `/metrics`.
+/// Delivery outcomes per URL, for `/metrics`, and how many deliveries are still
+/// in flight.
 #[derive(Debug, Default)]
 pub struct Stats {
     per_url: Vec<[AtomicU64; 3]>,
+    /// Events queued for a URL and not yet delivered, failed or dropped.
+    pending: std::sync::atomic::AtomicUsize,
 }
 
 /// The outcomes counted, as `tfps_hook_deliveries_total`'s `result` label.
@@ -319,6 +322,7 @@ impl Stats {
     pub fn new(urls: usize) -> Self {
         Stats {
             per_url: (0..urls).map(|_| Default::default()).collect(),
+            pending: Default::default(),
         }
     }
 
@@ -326,6 +330,12 @@ impl Stats {
         if let Some(c) = self.per_url.get(url) {
             c[result].fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Whether every queued event has reached an outcome: the moment the
+    /// cursor can be saved without losing an event still in a queue.
+    pub fn idle(&self) -> bool {
+        self.pending.load(Ordering::SeqCst) == 0
     }
 
     /// `(url index, result, count)` for every URL and result.
@@ -373,11 +383,14 @@ impl Sender {
         };
         let body = Arc::new(body);
         for (i, q) in self.queues.iter().enumerate() {
-            match q.try_send(Arc::clone(&body)) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => self.stats.add(i, QUEUE_FULL),
-                Err(TrySendError::Disconnected(_)) => self.stats.add(i, FAILED),
-            }
+            self.stats.pending.fetch_add(1, Ordering::SeqCst);
+            let refused = match q.try_send(Arc::clone(&body)) {
+                Ok(()) => continue,
+                Err(TrySendError::Full(_)) => QUEUE_FULL,
+                Err(TrySendError::Disconnected(_)) => FAILED,
+            };
+            self.stats.add(i, refused);
+            self.stats.pending.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -395,6 +408,7 @@ fn deliver(index: usize, url: &str, rx: &Receiver<Arc<Vec<u8>>>, retry: &Retry, 
             let error = match answer {
                 Ok(r) if r.status().is_success() => {
                     stats.add(index, DELIVERED);
+                    stats.pending.fetch_sub(1, Ordering::SeqCst);
                     break;
                 }
                 Ok(r) => format!("status {}", r.status().as_u16()),
@@ -407,6 +421,7 @@ fn deliver(index: usize, url: &str, rx: &Receiver<Arc<Vec<u8>>>, retry: &Retry, 
                 }
                 None => {
                     stats.add(index, FAILED);
+                    stats.pending.fetch_sub(1, Ordering::SeqCst);
                     eprintln!(
                         "tfps_ctl serve: webhook {index} ({url}) failed after {} attempts: {error}; event dropped",
                         attempt + 1
@@ -440,7 +455,7 @@ pub fn cursor_path(ctx: &Ctx) -> PathBuf {
 /// Watches and delivers until the process ends. Never returns on its own; every
 /// failure to read is said and retried at the next poll, never fatal.
 pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
-    let sender = Sender::start(urls, &Retry::default(), QUEUE, stats);
+    let sender = Sender::start(urls, &Retry::default(), QUEUE, Arc::clone(&stats));
     let mut watcher = Watcher::new(host_name());
     let manual_dir = crate::ctl::manual_dir(ctx);
     let cursor_file = cursor_path(ctx);
@@ -466,6 +481,7 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
         },
     };
     let mut said = None::<String>;
+    let mut saved = cursor.clone();
     loop {
         let more = match poll_once(ctx, &manual_dir, &mut cursor, &mut watcher, &sender) {
             Ok(more) => {
@@ -480,7 +496,12 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
                 false
             }
         };
-        save_or_say(&cursor_file, &cursor);
+        // Saved only when nothing is in flight: an event still queued when
+        // `serve` stops is then sent again after the restart, never skipped.
+        if stats.idle() && cursor != saved {
+            save_or_say(&cursor_file, &cursor);
+            saved = cursor.clone();
+        }
         if !more {
             std::thread::sleep(every);
         }
@@ -503,19 +524,33 @@ fn poll_once(
     sender: &Sender,
 ) -> Result<bool, String> {
     let store = Store::open_readonly(&ctx.db)?;
-    let (end, _) = store.block_log_end()?;
-    if end < cursor.block_log {
-        // Row numbers started again: the table was emptied. Take up from the
-        // start, skipping rows no newer than the last one sent.
+    // Row numbers that started again (the table emptied by pruning, then
+    // refilled) are taken up from the start, skipping rows no newer than the
+    // last one sent.
+    let cutoff = if cursor.block_log > 0
+        && store.block_log_restarted(cursor.block_log, cursor.block_log_ts)?
+    {
         cursor.block_log = 0;
-    }
-    let rows: Vec<(i64, BlockRow)> = store
-        .block_log_after(cursor.block_log, ROWS_PER_POLL)?
+        Some(cursor.block_log_ts)
+    } else {
+        None
+    };
+    let raw = store.block_log_after(cursor.block_log, ROWS_PER_POLL)?;
+    let more = raw.len() == ROWS_PER_POLL;
+    let last = raw.last().map(|(row, r)| (*row, r.ts));
+    let blocks: Vec<BlockRow> = raw
         .into_iter()
-        .filter(|(_, r)| cursor.block_log != 0 || r.ts >= cursor.block_log_ts)
+        .map(|(_, r)| r)
+        .filter(|r| cutoff.is_none_or(|c| r.ts > c))
         .collect();
-    let more = rows.len() == ROWS_PER_POLL;
-    let (manual, manual_pos, _) = crate::manual_log::read_after(manual_dir, &cursor.manual);
+    let (manual, manual_pos, unreadable) =
+        crate::manual_log::read_after(manual_dir, &cursor.manual);
+    if unreadable > 0 {
+        eprintln!(
+            "WARNING: {unreadable} line(s) of the manual-action record could not be read; \
+             their webhook events are not sent"
+        );
+    }
 
     let run = ctx
         .state
@@ -528,7 +563,6 @@ fn poll_once(
         Some(entries) if watcher.needs_baseline(run) => known_among(&store, manual_dir, entries),
         _ => HashSet::new(),
     };
-    let (row_numbers, blocks): (Vec<i64>, Vec<BlockRow>) = rows.into_iter().unzip();
     let events = watcher.poll(&Seen {
         blocks: &blocks,
         manual: &manual,
@@ -540,11 +574,9 @@ fn poll_once(
     for e in &events {
         sender.send(e);
     }
-    if let (Some(row), Some(r)) = (row_numbers.last(), blocks.last()) {
-        cursor.block_log = *row;
-        cursor.block_log_ts = r.ts;
-    } else if cursor.block_log == 0 && end > 0 {
-        cursor.block_log = end;
+    if let Some((row, ts)) = last {
+        cursor.block_log = row;
+        cursor.block_log_ts = ts;
     }
     cursor.manual = manual_pos;
     Ok(more)
@@ -968,6 +1000,22 @@ mod tests {
             start.elapsed()
         );
         wait_for(&stats, 1, "delivered", 3);
+    }
+
+    #[test]
+    fn the_sender_is_idle_only_when_every_event_has_an_outcome() {
+        let (url, rx) = receiver(200, Duration::from_millis(300));
+        let stats = Arc::new(Stats::new(1));
+        let s = Sender::start(&[url], &quick(), 10, Arc::clone(&stats));
+        assert!(stats.idle());
+        s.send(&event());
+        assert!(
+            !stats.idle(),
+            "in flight: the cursor must not move past it yet"
+        );
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        wait_for(&stats, 0, "delivered", 1);
+        assert!(stats.idle());
     }
 
     #[test]

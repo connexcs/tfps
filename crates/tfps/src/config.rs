@@ -138,19 +138,36 @@ pub struct Config {
     pub hooks_poll_secs: Option<u64>,
 }
 
-/// The webhook URLs that are not `http://` or `https://` URLs with a host.
-/// A typo here would otherwise send nothing, silently.
+/// The webhook URLs that are not `http://` or `https://` URLs with a host, as
+/// the HTTP client that sends them parses them (so a bad port or a space is
+/// refused at start, not at the first event). A typo here would otherwise send
+/// nothing, silently.
 pub fn bad_hooks(hooks: &[String]) -> Vec<&str> {
     hooks
         .iter()
         .filter(|u| {
-            let rest = u
-                .strip_prefix("https://")
-                .or_else(|| u.strip_prefix("http://"));
-            !rest.is_some_and(|r| {
-                let host = r.split(['/', '?', '#']).next().unwrap_or("");
-                !host.is_empty() && !host.contains(char::is_whitespace)
-            })
+            let Ok(uri) = u.parse::<ureq::http::Uri>() else {
+                return true;
+            };
+            let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+            let host_ok = uri.host().is_some_and(|h| !h.is_empty());
+            // The parser reads a port lazily, so a non-numeric one passes it:
+            // whatever follows the host's last `:` must be a port number.
+            let port_ok = uri.authority().is_some_and(|a| {
+                let hostport = a.as_str().rsplit('@').next().unwrap_or("");
+                match hostport.strip_prefix('[') {
+                    Some(v6) => v6.split_once(']').is_some_and(|(_, rest)| {
+                        rest.is_empty()
+                            || rest
+                                .strip_prefix(':')
+                                .is_some_and(|p| p.parse::<u16>().is_ok())
+                    }),
+                    None => hostport
+                        .rsplit_once(':')
+                        .is_none_or(|(_, p)| p.parse::<u16>().is_ok()),
+                }
+            });
+            !(scheme_ok && host_ok && port_ok)
         })
         .map(String::as_str)
         .collect()
@@ -413,9 +430,9 @@ mod tests {
     fn hooks_are_off_by_default_and_must_be_http_urls() {
         let c = parse("{}").expect("empty");
         assert!(c.hooks.is_empty() && c.hooks_poll_secs.is_none());
-        let c = parse(r#"{"hooks": ["https://panel.example.com/tfps/events", "http://127.0.0.1:8080/hook"], "hooks_poll_secs": 5}"#)
+        let c = parse(r#"{"hooks": ["https://panel.example.com/tfps/events", "http://127.0.0.1:8080/hook", "https://[::1]:8443/h"], "hooks_poll_secs": 5}"#)
             .expect("parses");
-        assert_eq!(c.hooks.len(), 2);
+        assert_eq!(c.hooks.len(), 3);
         assert_eq!(c.hooks_poll_secs, Some(5));
         assert!(bad_hooks(&c.hooks).is_empty());
         let bad = vec![
@@ -423,8 +440,13 @@ mod tests {
             "panel.example.com/hook".to_string(),
             "https:///nohost".to_string(),
             "http://has space/x".to_string(),
+            "https://panel.example:bad-port/hook".to_string(),
+            "https://panel.example/a path".to_string(),
         ];
-        assert_eq!(bad_hooks(&bad).len(), 4);
+        assert_eq!(
+            bad_hooks(&bad),
+            bad.iter().map(String::as_str).collect::<Vec<_>>()
+        );
     }
 
     #[test]

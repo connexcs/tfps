@@ -692,6 +692,27 @@ impl Store {
             .collect()
     }
 
+    /// Whether `block_log`'s row numbers have started again since row `row` was
+    /// read with time `ts`: the table was emptied (pruning) and refilled, so
+    /// row numbers no longer mean what the cursor saved. True when that row now
+    /// holds a different time, or is gone with the newest row below it.
+    pub fn block_log_restarted(&self, row: i64, ts: u32) -> Result<bool, String> {
+        let at: Option<u32> = self
+            .conn
+            .query_row("SELECT ts FROM block_log WHERE rowid = ?1", [row], |r| {
+                r.get(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                e => Err(format!("reading block_log: {e}")),
+            })?;
+        Ok(match at {
+            Some(t) => t != ts,
+            None => self.block_log_end()?.0 < row,
+        })
+    }
+
     /// The newest `block_log` row number and its time, or `(0, 0)` when empty.
     pub fn block_log_end(&self) -> Result<(i64, u32), String> {
         self.conn
@@ -985,6 +1006,39 @@ mod tests {
         assert!(
             s.block_log_after(end, 100).unwrap().is_empty(),
             "nothing new"
+        );
+        assert!(
+            !s.block_log_restarted(end, 300).unwrap(),
+            "same row, same time"
+        );
+
+        // Emptied and refilled past the saved row: row numbers started again,
+        // and the saved row now holds a newer block.
+        s.conn.execute("DELETE FROM block_log", []).unwrap();
+        for i in 0..5u8 {
+            s.log_block(
+                400 + u32::from(i),
+                std::net::Ipv4Addr::new(198, 51, 100, i),
+                "scanner",
+                "x",
+            )
+            .unwrap();
+        }
+        assert!(
+            s.block_log_restarted(end, 300).unwrap(),
+            "refilled beyond the saved row"
+        );
+        s.conn.execute("DELETE FROM block_log", []).unwrap();
+        s.log_block(
+            500,
+            std::net::Ipv4Addr::new(198, 51, 100, 9),
+            "scanner",
+            "x",
+        )
+        .unwrap();
+        assert!(
+            s.block_log_restarted(end, 300).unwrap(),
+            "refilled below the saved row"
         );
         drop(s);
         let _ = std::fs::remove_file(&p);

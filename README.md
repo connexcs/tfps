@@ -722,8 +722,10 @@ of a block. `host` is this machine's name.
 endpoint delays no other. An event is POSTed with a 5-second timeout and retried after 1, 2 and
 4 seconds; then it is dropped and counted. `/metrics` exports
 `tfps_hook_deliveries_total{url_index,result="delivered|failed|queue_full"}`. Where reading
-stopped is kept in `/var/lib/tfps/hooks.cursor`, so a restart neither replays history nor skips
-what was written meanwhile; the first start begins at the current end.
+stopped is kept in `/var/lib/tfps/hooks.cursor`, saved only when every queued event has been
+delivered or given up on, so a restart never skips what was written meanwhile; events still
+queued when `serve` stopped are sent again after it starts (at-least-once). The first start
+begins at the current end.
 
 **Known limits.**
 
