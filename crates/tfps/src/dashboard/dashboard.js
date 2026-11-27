@@ -20,14 +20,24 @@ let inFlight = false;
 // The block listing in flight, shared: the API serves one full listing at a
 // time (a second gets 503), so a newer refresh waits on this one instead.
 let blocksPending = null;
+let blocksPendingToken = null;
 
 function listing() {
-  if (!blocksPending) {
-    blocksPending = api("/v1/blocks").finally(() => {
-      blocksPending = null;
-    });
-  }
-  return blocksPending;
+  const t = token();
+  if (blocksPending && blocksPendingToken === t) return blocksPending;
+  // A listing sent with other credentials (none, before a token was entered)
+  // is no use to this refresh. Wait for it to finish, so the two never hold
+  // the API's one listing slot at once, then ask again with the current token.
+  const prior = blocksPending ? blocksPending.catch(() => {}) : Promise.resolve();
+  const request = prior.then(() => api("/v1/blocks"));
+  blocksPending = request;
+  blocksPendingToken = t;
+  request
+    .finally(() => {
+      if (blocksPending === request) blocksPending = null;
+    })
+    .catch(() => {}); // the caller handles the outcome
+  return request;
 }
 let windowName = "last_day";
 let lastStats = null;
