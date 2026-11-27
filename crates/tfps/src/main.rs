@@ -936,7 +936,7 @@ fn main() -> ExitCode {
                 settle(
                     &dec,
                     subject,
-                    m.transport.spoofable(),
+                    m.spoofable(),
                     t,
                     policy,
                     &mut ignoreip,
@@ -1759,7 +1759,7 @@ mod tests {
                 let outcome = settle(
                     &dec,
                     subject,
-                    m.transport.spoofable(),
+                    m.spoofable(),
                     t,
                     p,
                     ignoreip,
@@ -1833,7 +1833,7 @@ mod tests {
             let got = settle(
                 &dec,
                 subject,
-                m.transport.spoofable(),
+                m.spoofable(),
                 t,
                 policy(true),
                 &mut tfps_core::ignore::IgnoreList::new(),

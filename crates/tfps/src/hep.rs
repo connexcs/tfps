@@ -43,6 +43,20 @@ pub struct Delivered {
     pub dst_port: Option<u16>,
     pub transport: Transport,
     pub payload: Vec<u8>,
+    /// The datagram itself cannot have been forged: it came from a loopback
+    /// address, which the network cannot fake, or it carried the configured
+    /// `auth_key`. Only then is the transport it claims believed.
+    pub proven: bool,
+}
+
+impl Delivered {
+    /// Whether the message's source address could have been forged, for
+    /// `--no-enforce-one-way`. A TCP transport says the handshake proved it, but
+    /// that is the HEP sender's claim, believed only from a sender that is
+    /// itself [`proven`](Self::proven).
+    pub fn spoofable(&self) -> bool {
+        self.transport.spoofable() || !self.proven
+    }
 }
 
 /// What the listener has done, shared with the main loop for its reports.
@@ -121,13 +135,11 @@ pub fn handle(
     counters: &Counters,
 ) -> Option<Delivered> {
     Counters::bump(&counters.received);
-    let allowed = match sender {
-        SocketAddr::V4(a) => s.allow_from.contains(a.ip()),
-        SocketAddr::V6(a) => a
-            .ip()
-            .to_ipv4_mapped()
-            .is_some_and(|ip| s.allow_from.contains(&ip)),
+    let sender_v4 = match sender {
+        SocketAddr::V4(a) => Some(*a.ip()),
+        SocketAddr::V6(a) => a.ip().to_ipv4_mapped(),
     };
+    let allowed = sender_v4.is_some_and(|ip| s.allow_from.contains(&ip));
     if !allowed {
         Counters::bump(&counters.rejected_sender);
         return None;
@@ -151,6 +163,9 @@ pub fn handle(
             dst_port: m.dst_port,
             transport: m.transport,
             payload: m.payload.to_vec(),
+            // `classify` has already refused a packet without the key when one
+            // is configured, so a configured key means this one carried it.
+            proven: sender_v4.is_some_and(|ip| ip.is_loopback()) || s.auth_key.is_some(),
         }),
         Err(skip) => {
             Counters::bump(match skip {
@@ -508,6 +523,7 @@ mod tests {
             dst_port: None,
             transport: Transport::Tcp,
             payload: vec![b'x'; 60_000],
+            proven: true,
         };
         let fits = QUEUE_BYTES / big.payload.len();
         for _ in 0..fits + 10 {
@@ -568,6 +584,46 @@ mod tests {
         c.mirrored(443, 0);
         assert!(c.newly_silent(SILENCE_SECS * 10).is_empty());
         assert_eq!(c.uncovered(SILENCE_SECS * 10), 0);
+    }
+
+    /// The transport is believed only from a sender that cannot be forged: a
+    /// loopback address, or one that carried the configured key.
+    #[test]
+    fn tcp_evidence_is_trusted_only_from_a_proven_sender() {
+        let c = Counters::default();
+        let remote: SocketAddr = "10.0.0.3:40000".parse().unwrap();
+        let open = Settings {
+            allow_from: vec![Ipv4Addr::LOCALHOST, Ipv4Addr::new(10, 0, 0, 3)],
+            ..settings()
+        };
+        let keyed = Settings {
+            auth_key: Some(b"s3cret".to_vec()),
+            ..open.clone()
+        };
+        let tcp = |key| packet(IPPROTO_TCP, NOW, key);
+        for (what, sender, s, key, spoofable) in [
+            ("loopback, no key", loopback(), &open, None, false),
+            ("remote, no key", remote, &open, None, true),
+            ("remote, with key", remote, &keyed, Some("s3cret"), false),
+        ] {
+            let m = handle(&tcp(key), sender, s, NOW, &c).expect(what);
+            assert_eq!(m.transport, Transport::Tcp, "{what}");
+            assert_eq!(m.spoofable(), spoofable, "{what}");
+        }
+        // UDP is spoofable whoever sends it.
+        let udp_ok = Settings {
+            udp: true,
+            ..open.clone()
+        };
+        let m = handle(
+            &packet(IPPROTO_UDP, NOW, None),
+            loopback(),
+            &udp_ok,
+            NOW,
+            &c,
+        )
+        .unwrap();
+        assert!(m.spoofable());
     }
 
     /// The real socket: bind, send from loopback, receive on the channel.
