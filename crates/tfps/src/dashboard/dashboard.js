@@ -320,10 +320,17 @@ async function refreshAs(gen) {
   if (gen !== generation) return; // superseded by a newer refresh
   const results = [status, stats, log, blocks].filter(Boolean);
   if (results.some((r) => r.status === "rejected" && r.reason instanceof AuthError)) {
+    // Nothing on the page can be read any more: say so, rather than keep the
+    // last answers on screen as if they were current.
     needToken(true);
+    statusUnknown();
+    lastUpdate = 0;
+    showUpdated();
+    document.body.classList.add("stale");
     return;
   }
   needToken(false);
+  document.body.classList.remove("stale");
 
   if (status.status === "fulfilled") {
     renderStatus(status.value);
