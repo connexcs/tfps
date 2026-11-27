@@ -1254,7 +1254,11 @@ mod tests {
                 blocks_24h: vec![("scanner".into(), 5), ("weird \"reason\"\n".into(), 1)],
                 blocks_7d: vec![("scanner".into(), 9)],
                 apiban_feed: 2,
-                traffic: crate::ctl::traffic_doc(Some("udp=120 syn=40 bad=xx"), Some(1_000), 1_060),
+                traffic: crate::ctl::traffic_doc(
+                    Some("udp=120 syn=40 bad=xx hep_sip=7 hep_rejected_sender=2"),
+                    Some(1_000),
+                    1_060,
+                ),
                 learned: crate::ctl::learned_doc(5, 5, 3, 77),
             })
         }
@@ -1989,6 +1993,12 @@ mod tests {
         );
         assert_eq!(m["tfps_apiban_feed_entries"], 2.0);
         assert_eq!(m[r#"tfps_traffic_total{counter="udp"}"#], 120.0);
+        // The HEP listener's counters ride the same checkpoint line.
+        assert_eq!(m[r#"tfps_traffic_total{counter="hep_sip"}"#], 7.0);
+        assert_eq!(
+            m[r#"tfps_traffic_total{counter="hep_rejected_sender"}"#],
+            2.0
+        );
         assert!(
             !m.keys().any(|k| k.contains(r#"counter="bad""#)),
             "a counter that will not parse is left out"

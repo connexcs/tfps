@@ -18,6 +18,7 @@ use std::io::Read;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -76,6 +77,8 @@ struct Args {
     /// Per-peer dial plan from the file. Declaring beats learning because it holds on
     /// that peer's very first call.
     peer_plans: Vec<(Ipv4Addr, DialPlan)>,
+    /// The HEP listener's section from the configuration file.
+    hep: Option<config::HepConfig>,
     /// Which flags the operator actually passed — the file only fills in the rest.
     given: std::collections::HashSet<String>,
 }
@@ -112,6 +115,7 @@ impl Default for Args {
             signatures: None,
             config: PathBuf::from(config::DEFAULT_PATH),
             peer_plans: Vec::new(),
+            hep: None,
             given: std::collections::HashSet::new(),
         }
     }
@@ -251,6 +255,7 @@ fn apply_config(a: &mut Args, c: &config::Config) {
     // No command-line flags for these two: they are installation settings.
     a.manual_log_dir = c.manual_log_dir.clone();
     a.reapply_manual_bans = c.reapply_manual_bans;
+    a.hep = c.hep.clone();
     unless_given!("--xdp-obj", xdp_obj, c.xdp_obj.clone());
     unless_given!("--drop-map", shared_map, c.drop_map.clone());
 
@@ -639,6 +644,59 @@ fn main() -> ExitCode {
         }
     }
 
+    // The HEP listener, when configured: the decrypted SIP the application server
+    // mirrors from its TLS and WebSocket connections. Nothing is bound otherwise.
+    let hep_counters = Arc::new(tfps::hep::Counters::default());
+    let hep_rx = match args.hep.as_ref().filter(|h| h.enabled) {
+        None => None,
+        Some(h) => {
+            if !h.listen.ip().is_loopback() {
+                eprintln!(
+                    "WARNING: the HEP listener is on {}, not loopback. Any sender in \
+                     `allow_from` can get an address blocked{}.",
+                    h.listen,
+                    if h.auth_key.is_some() {
+                        ""
+                    } else {
+                        "; set `auth_key` too"
+                    }
+                );
+            }
+            if h.transports.is_empty() {
+                eprintln!("WARNING: HEP `transports` is empty: every mirrored message is skipped");
+            }
+            // Fail closed: a listener weaker than its configuration claims is
+            // worse than none, and this one is announced loudly.
+            let started = match h.problem() {
+                Some(p) => Err(std::io::Error::other(p)),
+                None => tfps::hep::spawn(h, Arc::clone(&hep_counters)),
+            };
+            match started {
+                Ok((rx, addr)) => {
+                    say!(
+                        "  HEP input         : UDP {addr}, from {:?}, transports {:?}{}",
+                        h.allow_from,
+                        h.transports,
+                        if h.auth_key.is_some() {
+                            ", auth key required"
+                        } else {
+                            ""
+                        }
+                    );
+                    Some(rx)
+                }
+                Err(e) => {
+                    eprintln!(
+                        "ALARM: the HEP listener on {} did not start: {e}. SIP over TLS and \
+                         WebSocket will NOT be inspected.",
+                        h.listen
+                    );
+                    None
+                }
+            }
+        }
+    };
+
     let sock = match Socket::new(
         Domain::from(AF_PACKET),
         Type::DGRAM,
@@ -656,7 +714,14 @@ fn main() -> ExitCode {
     // alarm can never fire**: it would sit inside a loop that only runs when a packet
     // arrives, and a system seeing nothing would stay mute — precisely the fail2ban failure
     // mode this project uses as its difference (`SPEC.md` §12).
-    if let Err(e) = sock.set_read_timeout(Some(Duration::from_secs(1))) {
+    // With HEP on, the loop also drains the HEP queue, so it wakes more often: a
+    // mirrored message must not wait a second for a packet on a quiet link.
+    let read_timeout = if hep_rx.is_some() {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_secs(1)
+    };
+    if let Err(e) = sock.set_read_timeout(Some(read_timeout)) {
         eprintln!("warning: could not set a read timeout: {e}");
         eprintln!("         the silence alarm may not fire on a quiet link.");
     }
@@ -744,6 +809,16 @@ fn main() -> ExitCode {
     let (mut n_ipv6, mut n_tcp, mut n_frag) = (0u64, 0u64, 0u64);
     let mut blind_warned = false;
     let mut auth_blind_warned = false;
+    let policy = Policy {
+        enforce_behavioural: args.enforce_behavioural,
+        no_enforce_one_way: args.no_enforce_one_way,
+        block_ttl: args.block_ttl,
+        verbose: args.verbose,
+    };
+    // HEP's own alarms: silence while TCP is seen on the SIP ports, and a
+    // mirrored port that XDP does not cover.
+    let mut coverage = tfps::hep::Coverage::new(start.0);
+    let mut hep_port_warned = std::collections::BTreeSet::new();
 
     loop {
         let n = match sock.read(&mut buf) {
@@ -774,8 +849,11 @@ fn main() -> ExitCode {
                     // the administrator's own SSH session, turning the warning into noise.
                     NotUdp::Tcp => {
                         if let Some((sp, dp)) = tcp_ports(&buf[..n]) {
-                            if args.ports.contains(&sp) || args.ports.contains(&dp) {
+                            // The SIP port: where it went, or where it came from.
+                            let port = [dp, sp].into_iter().find(|p| args.ports.contains(p));
+                            if let Some(port) = port {
                                 n_tcp += 1;
+                                coverage.tcp_seen(port);
                             }
                         }
                     }
@@ -791,97 +869,16 @@ fn main() -> ExitCode {
                     // `401` is evidence about whoever is *receiving* it. The engine returns
                     // the subject so the block lands on the right party.
                     let (subject, dec) = engine.observe_packet(d.src, d.dst, d.payload, t);
-                    // Perimeter noise condemns the source: its next packets die at XDP,
-                    // before the libpcap tap, and vanish from sngrep.
-                    // A behavioural Block is enforced only when the operator asked for
-                    // it. It goes through the same disposition gate (ignoreip first) and
-                    // is written to XDP for block_ttl; the forged 603 is still missing.
-                    let reason = enforcement_reason(&dec, args.enforce_behavioural);
-                    let reason = reason
-                        .as_ref()
-                        .map(|(kind, detail)| (*kind, detail.as_ref()));
-                    let exempt = reason.and_then(|_| ignoreip.exempt(subject).map(str::to_string));
-                    // One-way evidence is a request with no response from the expected
-                    // responder. A UDP source can be spoofed, so with
-                    // --no-enforce-one-way it is reported but never written to the block
-                    // map. Auth-failure is response-based and still enforces.
-                    let one_way = reason.is_some_and(|(kind, _)| is_one_way(kind));
-                    // A total match, not a chain: the defect this replaces was a
-                    // missing arm, and a chain can silently lack one where an
-                    // exhaustive match cannot. `SPEC.md` §12 makes silence an alarm.
-                    // A registered IP no longer bypasses active perimeter evidence. A
-                    // compromised PBX with valid credentials (the target threat) would
-                    // otherwise be immune to injection, auth-failure, registration-scan and
-                    // auth-volume rules for seven days. The APIBAN integration still honours
-                    // known peers, because that feed is third-party reputation, not our own
-                    // observation.
-                    let enforcing = enforcer.is_some() && !(args.no_enforce_one_way && one_way);
-                    match disposition(reason, exempt.as_deref(), false, enforcing) {
-                        Disposition::Ignore => {}
-                        Disposition::ExemptIgnoreIp { kind, detail, rule } => {
-                            // Judged, reported, not enforced. Staying silent here would hide
-                            // a compromised trusted peer, which is when it matters most.
-                            say!(
-                                "EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}"
-                            );
-                        }
-                        Disposition::ExemptKnownPeer { kind, detail } => {
-                            // A registered peer that authenticated is known-good — never
-                            // banned, whatever a signature or the feed says. The dynamic
-                            // ignoreip.
-                            say!(
-                                "EXEMPT peer={subject} reason={kind} detail={detail} (registered peer)"
-                            );
-                        }
-                        Disposition::WouldBlock { kind, detail } => {
-                            // Observing only. Nothing is blocked and nothing is written to
-                            // the audit log, which has no column to say a block did not
-                            // happen — but the operator is told, which is the whole point of
-                            // running with --no-enforce / --no-enforce-one-way.
-                            let why = if args.no_enforce_one_way && one_way {
-                                "one-way report-only"
-                            } else {
-                                "observe only"
-                            };
-                            say!(
-                                "WOULD BLOCK peer={subject} reason={kind} detail={detail} ({why})"
-                            );
-                        }
-                        Disposition::Block { kind, detail } => {
-                            // The `None` arm is unreachable by construction: `disposition`
-                            // returns `Block` only when an enforcer exists, which its own
-                            // tests pin exhaustively. It alarms rather than being silent,
-                            // because an unreachable branch that says nothing is how this
-                            // defect happened in the first place.
-                            match enforcer.as_mut() {
-                                Some(e) => match e.block(subject, args.block_ttl) {
-                                    Ok(()) => {
-                                        say!(
-                                            "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
-                                            args.block_ttl
-                                        );
-                                        // Durable audit: the operator must be able to
-                                        // reconstruct the decision later, without relying
-                                        // on the journal.
-                                        if let Some(s) = db.as_ref() {
-                                            if let Err(e) = s.log_block(t.0, subject, kind, detail)
-                                            {
-                                                eprintln!(
-                                                    "ALARM: blocked {subject} but could not record it: {e}"
-                                                );
-                                            }
-                                        }
-                                    }
-                                    Err(err) => {
-                                        eprintln!("ALARM: could not block {subject}: {err}")
-                                    }
-                                },
-                                None => eprintln!(
-                                    "ALARM: condemned {subject} as Block with no enforcer attached"
-                                ),
-                            }
-                        }
-                    }
+                    settle(
+                        &dec,
+                        subject,
+                        true, // a UDP source on the wire can be forged
+                        t,
+                        policy,
+                        &mut ignoreip,
+                        enforcer.as_mut().map(|e| e as &mut dyn Blocker),
+                        db.as_ref(),
+                    );
                     if args.debug_unparsed
                         && matches!(&dec, Decision::OutOfScope(r) if *r == "not SIP")
                     {
@@ -907,13 +904,45 @@ fn main() -> ExitCode {
                             d.payload.len()
                         );
                     }
-                    // When enforcement is on, the BLOCKED/EXEMPT/WOULD BLOCK line from
-                    // disposition already carries the reason; do not also print the
-                    // report-only BLOCK line.
-                    if !(args.enforce_behavioural && matches!(&dec, Decision::Block { .. })) {
-                        report(&dec, subject, args.verbose);
+                }
+            }
+        }
+
+        // Mirrored SIP from the HEP listener. Bounded per pass, so a flood of it
+        // cannot starve the wire capture.
+        if let Some(inbox) = hep_rx.as_ref() {
+            for m in std::iter::from_fn(|| inbox.try_recv()).take(tfps::hep::QUEUE) {
+                // The server's side of the exchange: where a request went, or where
+                // an answer came from.
+                let is_response = m.payload.starts_with(b"SIP/2.0 ");
+                let server_port = if is_response { m.src_port } else { m.dst_port };
+                // Only a TCP mirror for a port covers that port's TCP on the wire:
+                // HEP over UDP, or with no port, covers nothing.
+                if let (Some(port), tfps_core::hep::Transport::Tcp) = (server_port, m.transport) {
+                    coverage.mirrored(port, t.0);
+                }
+                if let Some(port) = server_port {
+                    *seen_ports.entry(port).or_insert(0) += 1;
+                    if !args.ports.contains(&port) && hep_port_warned.insert(port) {
+                        eprintln!(
+                            "WARNING: HEP delivers SIP for port {port}, which is not in `ports` \
+                             {:?}. A source blocked from it is NOT dropped there by XDP; add \
+                             {port} to `ports`.",
+                            args.ports
+                        );
                     }
                 }
+                let (subject, dec) = engine.observe_packet(m.src, m.dst, &m.payload, t);
+                settle(
+                    &dec,
+                    subject,
+                    m.transport.spoofable(),
+                    t,
+                    policy,
+                    &mut ignoreip,
+                    enforcer.as_mut().map(|e| e as &mut dyn Blocker),
+                    db.as_ref(),
+                );
             }
         }
 
@@ -981,8 +1010,14 @@ fn main() -> ExitCode {
                     .map(|(label, _, hits)| format!("{label}={hits}"))
                     .collect::<Vec<_>>()
                     .join(" ");
+                let mut line = counter_line(&engine.stats);
+                if hep_rx.is_some() {
+                    for (k, v) in hep_counters.snapshot() {
+                        line.push_str(&format!(" {k}={v}"));
+                    }
+                }
                 for (k, v) in [
-                    ("stats", counter_line(&engine.stats)),
+                    ("stats", line),
                     ("stats_ts", t.0.to_string()),
                     ("started_at", start.0.to_string()),
                     ("ignoreip", ignoreip_line),
@@ -1077,17 +1112,53 @@ fn main() -> ExitCode {
             }
             // A signature that never matches is rotten and the operator needs to know —
             // exactly what fail2ban never did (`SPEC.md` §12).
-            if n_ipv6 + n_tcp > 0 {
-                say!("    blind spots: ipv6={n_ipv6} tcp={n_tcp} fragments={n_frag}");
-                if !blind_warned {
+            if hep_rx.is_some() {
+                let c = hep_counters.snapshot();
+                say!(
+                    "    HEP: {}",
+                    c.iter()
+                        .map(|(k, v)| format!("{}={v}", k.trim_start_matches("hep_")))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                // Silence is an alarm, port by port: TCP on a SIP port and nothing
+                // mirrored for it means TLS / WebSocket there are blind again.
+                for s in coverage.newly_silent(t.0) {
                     eprintln!(
-                        "WARNING: there is SIP this system does NOT analyse on ports {:?} — \
-                         IPv6={n_ipv6}, TCP={n_tcp}. That traffic passes uninspected \
-                         (SIP over TLS is structural blindness; see the README).",
-                        args.ports
+                        "ALARM: no HEP message for port {} in {}s while {} TCP packets were \
+                         seen on it. SIP over TLS and WebSocket there is NOT being inspected; \
+                         check the application server's HEP tracing.",
+                        s.port, s.secs, s.packets
                     );
-                    blind_warned = true;
                 }
+            }
+            // A port's TCP is covered while HEP delivers messages for that port:
+            // they are that TCP's SIP.
+            let tcp_blind = if hep_rx.is_some() {
+                coverage.uncovered(t.0)
+            } else {
+                n_tcp
+            };
+            if n_ipv6 + n_tcp > 0 {
+                let covered = n_tcp.saturating_sub(tcp_blind);
+                say!(
+                    "    blind spots: ipv6={n_ipv6} tcp={n_tcp}{} fragments={n_frag}",
+                    if covered > 0 {
+                        format!(" ({covered} covered by HEP)")
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+            if n_ipv6 + tcp_blind > 0 && !blind_warned {
+                eprintln!(
+                    "WARNING: there is SIP this system does NOT analyse on ports {:?} — \
+                     IPv6={n_ipv6}, TCP={tcp_blind}. That traffic passes uninspected \
+                     (for SIP over TLS and WebSocket, see \"TLS and WebSocket via HEP\" \
+                     in the README).",
+                    args.ports
+                );
+                blind_warned = true;
             }
             // The failure rule needs the softswitch's answer. Where none is ever seen it
             // cannot fire, and saying nothing about that would be the exact blindness this
@@ -1133,6 +1204,161 @@ fn main() -> ExitCode {
             }
         }
     }
+}
+
+/// What the step from a verdict to a block reads from the command line and file.
+#[derive(Debug, Clone, Copy)]
+struct Policy {
+    enforce_behavioural: bool,
+    no_enforce_one_way: bool,
+    block_ttl: u64,
+    verbose: bool,
+}
+
+/// Whatever places a block. The XDP enforcer in the daemon; a recorder in tests.
+trait Blocker {
+    fn block(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String>;
+}
+
+impl Blocker for xdp::Enforcer {
+    fn block(&mut self, ip: Ipv4Addr, ttl_secs: u64) -> Result<(), String> {
+        xdp::Enforcer::block(self, ip, ttl_secs)
+    }
+}
+
+/// What became of one judged message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    /// Nothing was tripped.
+    Ignored,
+    /// Tripped a rule, but `ignoreip` or a host address covers it.
+    Exempt,
+    /// Condemned while observing only, or one-way evidence under `--no-enforce-one-way`.
+    WouldBlock,
+    /// Written to the block map.
+    Blocked,
+    /// The block map refused the write.
+    BlockFailed,
+}
+
+/// From a verdict to an action: the one path that packets off the wire and
+/// messages mirrored over HEP share, so both get the same gate, the same block
+/// and the same audit row.
+///
+/// A registered peer is not shielded here, on either path: its own perimeter
+/// evidence still counts (see the comment on `enforcing` below). The gate is
+/// `ignoreip`, which holds the host's own addresses.
+///
+/// `spoofable` says whether the subject's address could have been forged. On the
+/// wire (UDP) it could, so `--no-enforce-one-way` keeps request-only evidence
+/// report-only. A HEP message that arrived over TCP had its address proved by
+/// the handshake, so that flag does not downgrade it.
+#[allow(clippy::too_many_arguments)]
+fn settle(
+    dec: &Decision,
+    subject: Ipv4Addr,
+    spoofable: bool,
+    t: Timestamp,
+    p: Policy,
+    ignoreip: &mut tfps_core::ignore::IgnoreList,
+    blocker: Option<&mut dyn Blocker>,
+    db: Option<&store::Store>,
+) -> Outcome {
+    // Perimeter noise condemns the source: its next packets die at XDP,
+    // before the libpcap tap, and vanish from sngrep.
+    // A behavioural Block is enforced only when the operator asked for
+    // it. It goes through the same disposition gate (ignoreip first) and
+    // is written to XDP for block_ttl; the forged 603 is still missing.
+    let reason = enforcement_reason(dec, p.enforce_behavioural);
+    let reason = reason
+        .as_ref()
+        .map(|(kind, detail)| (*kind, detail.as_ref()));
+    let exempt = reason.and_then(|_| ignoreip.exempt(subject).map(str::to_string));
+    // One-way evidence is a request with no response from the expected
+    // responder. A UDP source can be spoofed, so with
+    // --no-enforce-one-way it is reported but never written to the block
+    // map. Auth-failure is response-based and still enforces.
+    let one_way = spoofable && reason.is_some_and(|(kind, _)| is_one_way(kind));
+    // A total match, not a chain: the defect this replaces was a
+    // missing arm, and a chain can silently lack one where an
+    // exhaustive match cannot. `SPEC.md` §12 makes silence an alarm.
+    // A registered IP no longer bypasses active perimeter evidence. A
+    // compromised PBX with valid credentials (the target threat) would
+    // otherwise be immune to injection, auth-failure, registration-scan and
+    // auth-volume rules for seven days. The APIBAN integration still honours
+    // known peers, because that feed is third-party reputation, not our own
+    // observation.
+    let enforcing = blocker.is_some() && !(p.no_enforce_one_way && one_way);
+    let outcome = match disposition(reason, exempt.as_deref(), false, enforcing) {
+        Disposition::Ignore => Outcome::Ignored,
+        Disposition::ExemptIgnoreIp { kind, detail, rule } => {
+            // Judged, reported, not enforced. Staying silent here would hide
+            // a compromised trusted peer, which is when it matters most.
+            say!("EXEMPT peer={subject} reason={kind} detail={detail} ignoreip={rule}");
+            Outcome::Exempt
+        }
+        Disposition::ExemptKnownPeer { kind, detail } => {
+            // A registered peer that authenticated is known-good — never
+            // banned, whatever a signature or the feed says. The dynamic
+            // ignoreip.
+            say!("EXEMPT peer={subject} reason={kind} detail={detail} (registered peer)");
+            Outcome::Exempt
+        }
+        Disposition::WouldBlock { kind, detail } => {
+            // Observing only. Nothing is blocked and nothing is written to
+            // the audit log, which has no column to say a block did not
+            // happen — but the operator is told, which is the whole point of
+            // running with --no-enforce / --no-enforce-one-way.
+            let why = if p.no_enforce_one_way && one_way {
+                "one-way report-only"
+            } else {
+                "observe only"
+            };
+            say!("WOULD BLOCK peer={subject} reason={kind} detail={detail} ({why})");
+            Outcome::WouldBlock
+        }
+        Disposition::Block { kind, detail } => {
+            // The `None` arm is unreachable by construction: `disposition`
+            // returns `Block` only when an enforcer exists, which its own
+            // tests pin exhaustively. It alarms rather than being silent,
+            // because an unreachable branch that says nothing is how this
+            // defect happened in the first place.
+            match blocker {
+                Some(b) => match b.block(subject, p.block_ttl) {
+                    Ok(()) => {
+                        say!(
+                            "BLOCKED peer={subject} reason={kind} detail={detail} ttl={}s",
+                            p.block_ttl
+                        );
+                        // Durable audit: the operator must be able to
+                        // reconstruct the decision later, without relying
+                        // on the journal.
+                        if let Some(s) = db {
+                            if let Err(e) = s.log_block(t.0, subject, kind, detail) {
+                                eprintln!("ALARM: blocked {subject} but could not record it: {e}");
+                            }
+                        }
+                        Outcome::Blocked
+                    }
+                    Err(err) => {
+                        eprintln!("ALARM: could not block {subject}: {err}");
+                        Outcome::BlockFailed
+                    }
+                },
+                None => {
+                    eprintln!("ALARM: condemned {subject} as Block with no enforcer attached");
+                    Outcome::BlockFailed
+                }
+            }
+        }
+    };
+    // When enforcement is on, the BLOCKED/EXEMPT/WOULD BLOCK line from
+    // disposition already carries the reason; do not also print the
+    // report-only BLOCK line.
+    if !(p.enforce_behavioural && matches!(dec, Decision::Block { .. })) {
+        report(dec, subject, p.verbose);
+    }
+    outcome
 }
 
 fn enforcement_reason(
@@ -1428,5 +1654,208 @@ mod tests {
         apply_config(&mut b, &serde_json::from_str("{}").expect("parses"));
         assert!(b.manual_log_dir.is_none());
         assert!(!b.reapply_manual_bans, "off unless the file says so");
+    }
+
+    // ── HEP: the same path from verdict to block as the wire ──────────────────
+
+    use std::net::SocketAddr;
+    use tfps::hep::{handle, Counters, Settings};
+    use tfps_core::hep::build::{sip, Sip};
+    use tfps_core::hep::{IPPROTO_TCP, IPPROTO_UDP};
+
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+    const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+
+    /// Records every block instead of writing a kernel map.
+    #[derive(Default)]
+    struct Recorder(Vec<Ipv4Addr>);
+
+    impl Blocker for Recorder {
+        fn block(&mut self, ip: Ipv4Addr, _: u64) -> Result<(), String> {
+            self.0.push(ip);
+            Ok(())
+        }
+    }
+
+    fn policy(no_enforce_one_way: bool) -> Policy {
+        Policy {
+            enforce_behavioural: false,
+            no_enforce_one_way,
+            block_ttl: 3600,
+            verbose: false,
+        }
+    }
+
+    fn hep(from: (Ipv4Addr, u16), to: (Ipv4Addr, u16), ip_proto: u8, payload: &[u8]) -> Vec<u8> {
+        sip(&Sip {
+            src: from,
+            dst: to,
+            ip_proto,
+            ts: 1_795_000_000,
+            auth_key: None,
+            payload,
+        })
+    }
+
+    fn wss_register(n: u32) -> Vec<u8> {
+        format!(
+            "REGISTER sip:pbx.example.com SIP/2.0\r\n\
+             Via: SIP/2.0/WSS df7jal23ls0d.invalid;branch=z9hG4bK{n};rport\r\n\
+             From: <sip:1001@pbx.example.com>;tag=t1\r\n\
+             To: <sip:1001@pbx.example.com>\r\n\
+             Call-ID: wss-reg\r\n\
+             CSeq: {n} REGISTER\r\n\
+             Authorization: Digest username=\"1001\", realm=\"pbx\", response=\"deadbeef\"\r\n\
+             Contact: <sip:a8k2@df7jal23ls0d.invalid;transport=ws>\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    fn unauthorized(n: u32) -> Vec<u8> {
+        format!(
+            "SIP/2.0 401 Unauthorized\r\n\
+             Via: SIP/2.0/WSS df7jal23ls0d.invalid;branch=z9hG4bK{n};rport\r\n\
+             From: <sip:1001@pbx.example.com>;tag=t1\r\n\
+             To: <sip:1001@pbx.example.com>;tag=s1\r\n\
+             Call-ID: wss-reg\r\n\
+             CSeq: {n} REGISTER\r\n\
+             WWW-Authenticate: Digest realm=\"pbx\", nonce=\"abc{n}\"\r\n\
+             Content-Length: 0\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    /// Five rejected credentials, each delivered only as HEP over TCP (a WSS
+    /// client): what the daemon's loop does with each one.
+    fn failed_logins_over_hep(
+        p: Policy,
+        ignoreip: &mut tfps_core::ignore::IgnoreList,
+        mut blocker: Option<&mut Recorder>,
+    ) -> Vec<(Ipv4Addr, Outcome)> {
+        let mut engine = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let settings = Settings::from_config(&config::HepConfig::default());
+        let counters = Counters::default();
+        let lo: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let mut out = Vec::new();
+        for n in 0..5 {
+            for bytes in [
+                hep(
+                    (CLIENT, 51_234),
+                    (SERVER, 443),
+                    IPPROTO_TCP,
+                    &wss_register(n),
+                ),
+                hep(
+                    (SERVER, 443),
+                    (CLIENT, 51_234),
+                    IPPROTO_TCP,
+                    &unauthorized(n),
+                ),
+            ] {
+                let t = Timestamp(1_795_000_000 + n);
+                let m = handle(&bytes, lo, &settings, t.0, &counters).expect("accepted");
+                let (subject, dec) = engine.observe_packet(m.src, m.dst, &m.payload, t);
+                let outcome = settle(
+                    &dec,
+                    subject,
+                    m.transport.spoofable(),
+                    t,
+                    p,
+                    ignoreip,
+                    blocker.as_deref_mut().map(|b| b as &mut dyn Blocker),
+                    None,
+                );
+                out.push((subject, outcome));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn failed_logins_seen_only_over_hep_block_the_client_never_the_server() {
+        let mut blocks = Recorder::default();
+        let mut ignoreip = tfps_core::ignore::IgnoreList::new();
+        let got = failed_logins_over_hep(policy(false), &mut ignoreip, Some(&mut blocks));
+        assert_eq!(blocks.0, [CLIENT], "the client, once: {got:?}");
+        assert_eq!(got.last(), Some(&(CLIENT, Outcome::Blocked)));
+        assert!(
+            got.iter()
+                .all(|(s, o)| *s == CLIENT || *o == Outcome::Ignored),
+            "nothing is ever held against the server: {got:?}"
+        );
+
+        // --no-enforce: the same verdict, reported and not placed.
+        let mut ignoreip = tfps_core::ignore::IgnoreList::new();
+        let got = failed_logins_over_hep(policy(false), &mut ignoreip, None);
+        assert_eq!(got.last(), Some(&(CLIENT, Outcome::WouldBlock)));
+    }
+
+    #[test]
+    fn ignoreip_and_host_addresses_still_shield_hep_verdicts() {
+        for exempt in ["declared", "local"] {
+            let mut ignoreip = tfps_core::ignore::IgnoreList::new();
+            match exempt {
+                "declared" => ignoreip.add("198.51.100.0/24").unwrap(),
+                _ => ignoreip.add_local(CLIENT),
+            }
+            let mut blocks = Recorder::default();
+            let got = failed_logins_over_hep(policy(false), &mut ignoreip, Some(&mut blocks));
+            assert!(blocks.0.is_empty(), "{exempt}: {:?}", blocks.0);
+            assert_eq!(got.last(), Some(&(CLIENT, Outcome::Exempt)), "{exempt}");
+        }
+    }
+
+    /// `--no-enforce-one-way` exists because a UDP source can be forged. A HEP
+    /// message that arrived over TCP had its source proved by the handshake.
+    #[test]
+    fn no_enforce_one_way_spares_hep_over_tcp_but_not_udp() {
+        let probe = b"OPTIONS sip:test.echo@sip5060.net SIP/2.0\r\n\
+                      Via: SIP/2.0/TLS h;branch=z\r\n\
+                      From: \"censysinspect\" <sip:censysinspect@censys.io>;tag=t\r\n\
+                      To: <sip:test.echo@sip5060.net>\r\n\
+                      Call-ID: c\r\nCSeq: 1 OPTIONS\r\n\r\n";
+        let settings = Settings {
+            udp: true,
+            ..Settings::from_config(&config::HepConfig::default())
+        };
+        let lo: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        for (ip_proto, want) in [
+            (IPPROTO_TCP, Outcome::Blocked),
+            (IPPROTO_UDP, Outcome::WouldBlock),
+        ] {
+            let mut engine = Engine::new(DialPlan::new(["00"]), Mode::Active);
+            let bytes = hep((CLIENT, 51_234), (SERVER, 5061), ip_proto, probe);
+            let m = handle(&bytes, lo, &settings, 1_795_000_000, &Counters::default()).unwrap();
+            let t = Timestamp(1_795_000_000);
+            let (subject, dec) = engine.observe_packet(m.src, m.dst, &m.payload, t);
+            let mut blocks = Recorder::default();
+            let got = settle(
+                &dec,
+                subject,
+                m.transport.spoofable(),
+                t,
+                policy(true),
+                &mut tfps_core::ignore::IgnoreList::new(),
+                Some(&mut blocks),
+                None,
+            );
+            assert_eq!(got, want, "ip proto {ip_proto}");
+        }
+        // And wire UDP, which is always spoofable, stays report-only.
+        let mut engine = Engine::new(DialPlan::new(["00"]), Mode::Active);
+        let t = Timestamp(1_795_000_000);
+        let (subject, dec) = engine.observe_packet(CLIENT, SERVER, probe, t);
+        let got = settle(
+            &dec,
+            subject,
+            true,
+            t,
+            policy(true),
+            &mut tfps_core::ignore::IgnoreList::new(),
+            Some(&mut Recorder::default()),
+            None,
+        );
+        assert_eq!(got, Outcome::WouldBlock);
     }
 }

@@ -23,7 +23,9 @@
 //!   "apiban_key": "...",
 //!   "learn_days": 30,
 //!   "block_ttl": 3600,
-//!   "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false }
+//!   "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false },
+//!   "hep": { "enabled": false, "listen": "127.0.0.1:9061", "allow_from": ["127.0.0.1"],
+//!            "transports": ["tcp"], "auth_key": null }
 //! }
 //! ```
 
@@ -136,6 +138,83 @@ pub struct Config {
     pub hooks: Vec<String>,
     /// How often, in seconds, `tfps_ctl serve` looks for new events. Default 1.
     pub hooks_poll_secs: Option<u64>,
+    /// The optional HEP3 listener, through which the application server mirrors
+    /// the decrypted SIP it receives over TLS and WebSocket. Absent or not
+    /// `enabled`: no socket is bound.
+    pub hep: Option<HepConfig>,
+}
+
+/// Where the HEP listener goes by default: loopback, so only this host can send.
+pub const DEFAULT_HEP_LISTEN: SocketAddrV4 = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9061);
+
+/// A transport a mirrored message may have arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HepTransport {
+    /// TCP and everything over it: TLS, WebSocket, secure WebSocket.
+    Tcp,
+    /// UDP. The wire capture already sees it, so accepting it counts it twice.
+    Udp,
+}
+
+/// The `hep` section: the daemon's HEP3 listener.
+///
+/// **Off unless `enabled` is true.** Anyone who can send to the listener can get
+/// an address blocked, so it listens on loopback by default, drops senders not
+/// in `allow_from`, and can require a shared secret (`auth_key`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HepConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// An IPv4 `address:port` to receive HEP3 over UDP. Default `127.0.0.1:9061`.
+    #[serde(default = "default_hep_listen")]
+    pub listen: SocketAddrV4,
+    /// Senders accepted. Default `["127.0.0.1"]`. Anything else is dropped and counted.
+    #[serde(default = "default_hep_allow_from")]
+    pub allow_from: Vec<Ipv4Addr>,
+    /// Which transports' messages are judged. Default `["tcp"]`: UDP is already
+    /// seen on the wire.
+    #[serde(default = "default_hep_transports")]
+    pub transports: Vec<HepTransport>,
+    /// A shared secret every packet must carry (HEP chunk 14). Default: none.
+    pub auth_key: Option<String>,
+}
+
+impl Default for HepConfig {
+    fn default() -> Self {
+        HepConfig {
+            enabled: false,
+            listen: DEFAULT_HEP_LISTEN,
+            allow_from: default_hep_allow_from(),
+            transports: default_hep_transports(),
+            auth_key: None,
+        }
+    }
+}
+
+impl HepConfig {
+    /// A setting that would make the listener less safe than it says it is, or
+    /// `None`. An empty `auth_key` would be announced as "required" while any
+    /// packet with an empty chunk 14 passes it, so it is refused, not ignored.
+    pub fn problem(&self) -> Option<String> {
+        self.auth_key
+            .as_deref()
+            .is_some_and(str::is_empty)
+            .then(|| "`hep.auth_key` is empty; remove it, or set a real secret".to_string())
+    }
+}
+
+fn default_hep_listen() -> SocketAddrV4 {
+    DEFAULT_HEP_LISTEN
+}
+
+fn default_hep_allow_from() -> Vec<Ipv4Addr> {
+    vec![Ipv4Addr::LOCALHOST]
+}
+
+fn default_hep_transports() -> Vec<HepTransport> {
+    vec![HepTransport::Tcp]
 }
 
 /// The webhook URLs that are not `http://` or `https://` URLs with a host, as
@@ -413,6 +492,7 @@ mod tests {
             Some(HttpConfig::default()),
             "shipped with the API off"
         );
+        assert_eq!(c.hep, Some(HepConfig::default()), "shipped with HEP off");
     }
 
     #[test]
@@ -424,6 +504,59 @@ mod tests {
             parse(r#"{"http": {"listen": "127.0.0.1"}}"#).is_err(),
             "a port is required"
         );
+    }
+
+    #[test]
+    fn hep_is_off_loopback_and_tcp_only_by_default() {
+        assert!(parse("{}").expect("empty").hep.is_none());
+        let h = parse(r#"{"hep": {}}"#)
+            .expect("parses")
+            .hep
+            .expect("present");
+        assert_eq!(h, HepConfig::default());
+        assert!(!h.enabled);
+        assert_eq!(h.listen.to_string(), "127.0.0.1:9061");
+        assert_eq!(h.allow_from, [Ipv4Addr::LOCALHOST]);
+        assert_eq!(h.transports, [HepTransport::Tcp]);
+        assert!(h.auth_key.is_none());
+        let h = parse(
+            r#"{"hep": {"enabled": true, "listen": "10.0.0.2:9061",
+                        "allow_from": ["10.0.0.3", "127.0.0.1"],
+                        "transports": ["tcp", "udp"], "auth_key": "s3cret"}}"#,
+        )
+        .expect("parses")
+        .hep
+        .expect("present");
+        assert!(h.enabled);
+        assert_eq!(h.listen.to_string(), "10.0.0.2:9061");
+        assert_eq!(h.allow_from.len(), 2);
+        assert_eq!(h.transports, [HepTransport::Tcp, HepTransport::Udp]);
+        assert_eq!(h.auth_key.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn an_empty_hep_auth_key_is_a_problem_not_a_secret() {
+        let with = |key: &str| {
+            parse(&format!(r#"{{"hep": {{"auth_key": {key}}}}}"#))
+                .expect("parses")
+                .hep
+                .expect("present")
+        };
+        assert!(with("\"\"").problem().is_some(), "empty");
+        assert!(with("\"s3cret\"").problem().is_none());
+        assert!(with("null").problem().is_none(), "absent is not a problem");
+    }
+
+    #[test]
+    fn the_hep_section_refuses_typos() {
+        for bad in [
+            r#"{"hep": {"enable": true}}"#,
+            r#"{"hep": {"transports": ["tls"]}}"#,
+            r#"{"hep": {"allow_from": ["10.0.0.0/8"]}}"#,
+            r#"{"hep": {"listen": "[::1]:9061"}}"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

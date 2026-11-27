@@ -15,5 +15,12 @@
     "hosts": [],
     "allow_remote": false
   },
-  "hooks": []
+  "hooks": [],
+  "hep": {
+    "enabled": false,
+    "listen": "127.0.0.1:9061",
+    "allow_from": ["127.0.0.1"],
+    "transports": ["tcp"],
+    "auth_key": null
+  }
 }

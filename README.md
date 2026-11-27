@@ -49,7 +49,7 @@ Two layers, and the first is the product:
   research-grade layer, not a guarantee.
 
 > **Not a guarantee. Use at your own risk.** TFPS sees SIP on the wire only. It cannot detect
-> every fraud type (SIP over TLS/TCP content, IPv6, billing or insider fraud, social
+> every fraud type (SIP over TLS/TCP content that is not mirrored to it over HEP, IPv6, billing or insider fraud, social
 > engineering, low-and-slow mimicry, fraud that never touches the network). Behavioural
 > detection is experimental and report-only by default. Source-level XDP blocking is opt-in
 > with `--enforce-behavioural`, and the forged SIP `603` is still missing. Validate it on your
@@ -59,7 +59,8 @@ Two layers, and the first is the product:
 - **Static musl binaries** — `tfps` ≈ 4.3 MB, `tfps_ctl` ≈ 2.3 MB. No glibc dependency;
   they run on Ubuntu 24.04, Debian 12 and forward.
 - **No UDP bind** — capture is `AF_PACKET`, so your softswitch keeps its own socket on 5060
-  and never notices.
+  and never notices. (The optional HEP listener binds its own port, `127.0.0.1:9061` by
+  default, and only when you enable it.)
 - **Kernel-level drop** — condemned sources vanish from `sngrep`, `tcpdump` and `tshark`.
 
 > ⭐ **If TFPS keeps your `sngrep` clean or your bill honest, please star the repo** — it is
@@ -124,8 +125,9 @@ configured on the softswitch at all.
 | working | not yet |
 |---|---|
 | `AF_PACKET` capture, no port bind | — |
-| XDP enforcement of perimeter blocks (native/generic) | SIP over TCP (detection) |
-| perimeter: user-agent, URI injection, failed auth | IPv6, SIP over TLS |
+| XDP enforcement of perimeter blocks (native/generic) | SIP over TCP/TLS on the wire (detection) |
+| perimeter: user-agent, URI injection, failed auth | IPv6 |
+| SIP over TLS, WebSocket and TCP mirrored over HEP (opt-in) | HEP over TCP, compressed HEP |
 | APIBAN, background-synced and persisted | call-duration signal via `BYE` |
 | `ignoreip`, with the host's own addresses always exempt | day-31 activation confirmation |
 | four-arm behavioural detector, self-calibrating | |
@@ -359,12 +361,16 @@ integrations. Never **policy** configuration, which would say what fraud is.
 
   "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false },
   "hooks": [],
-  "hooks_poll_secs": 1
+  "hooks_poll_secs": 1,
+
+  "hep": { "enabled": false, "listen": "127.0.0.1:9061", "allow_from": ["127.0.0.1"],
+           "transports": ["tcp"], "auth_key": null }
 }
 ```
 
 `http` configures the optional JSON API and `hooks` the optional webhooks, both served by
-`tfps_ctl serve`; the daemon ignores them. See "JSON API" and "Webhooks" below.
+`tfps_ctl serve`; the daemon ignores them. See "JSON API" and "Webhooks" below. `hep` is the
+daemon's optional HEP listener; see "TLS and WebSocket via HEP".
 
 Precedence: **command line > file > built-in default**, so you can debug in production
 without editing a file. An **unknown field is an error**, not silence: an `apiban_kei`
@@ -745,6 +751,124 @@ begins at the current end.
 
 ---
 
+## TLS and WebSocket via HEP
+
+TFPS cannot read SIP over TLS or secure WebSocket (WSS) on the wire: it is encrypted. The
+application server that terminates it can mirror each message, decrypted, to TFPS over
+**HEP3**. TFPS then judges it as it judges UDP off the wire, and blocks through the same XDP
+program. Each HEP packet carries one whole SIP message, so this also covers plain SIP over
+TCP, which TFPS does not reassemble on the wire. **Off by default**: with no `hep` section, no
+socket is bound and nothing changes.
+
+It is built for one deployment: **OpenSIPS terminates TLS / WSS on the same host as TFPS** and
+mirrors to it over loopback. The address OpenSIPS reports is then the client's real address,
+and the XDP block lands on the machine that client connects to.
+
+```json
+"ports": [5060, 5061, 443],
+"hep": {
+  "enabled": true,
+  "listen": "127.0.0.1:9061",
+  "allow_from": ["127.0.0.1"],
+  "transports": ["tcp"],
+  "auth_key": null
+}
+```
+
+**`ports` must list the TLS and WSS ports** (here 5061 and 443), or XDP will not drop a blocked
+source there. TFPS warns once for each port it sees in HEP that `ports` does not list.
+
+### OpenSIPS
+
+An example for OpenSIPS 3.x; module parameters change between versions, so check it against
+yours:
+
+```
+socket = hep_udp:127.0.0.1:9062              # the socket HEP is sent from
+loadmodule "proto_hep.so"
+loadmodule "tracer.so"
+modparam("proto_hep", "hep_id", "[tfps] 127.0.0.1:9061; transport=udp; version=3")
+modparam("proto_hep", "homer5_on", 1)        # plain SIP payload, not the JSON form
+modparam("tracer", "trace_id", "[tfps]uri=hep:tfps")
+
+route {
+    trace("tfps", "t", "sip");               # this transaction: requests and replies
+    # ...
+}
+```
+
+- Trace **requests and their replies**: failed-authentication detection needs the `401` /
+  `407` answers.
+- Send the **plain SIP payload** (`homer5_on`), not the JSON-wrapped form.
+- Check that the HEP addresses are the client's and the listening socket's, in both
+  directions, on TLS and WSS connections: `tfps --verbose` prints each verdict's address.
+
+### Security model
+
+HEP is unauthenticated: whoever can send to the listener can get an address blocked. So:
+
+- it is **off** by default and listens on **loopback** by default; a non-loopback `listen`
+  is a startup `WARNING`;
+- packets from a sender not in `allow_from` are dropped and counted;
+- `auth_key` makes every packet carry that shared secret (HEP chunk 14); an empty one is
+  refused and the listener does not start;
+- `ignoreip` and the host's own addresses shield HEP verdicts exactly as they shield wire
+  verdicts. **An upstream proxy or load balancer must be in `ignoreip`.** (A registered peer
+  is not shielded from the perimeter's own evidence, on the wire or over HEP; see "Status".)
+
+**Transports.** By default only messages that arrived over **TCP** (which covers TLS, WS and
+WSS) are judged. OpenSIPS traces its UDP traffic too, which TFPS already sees on the wire;
+judging both would count each message twice. Add `"udp"` to `transports` only when the wire
+capture cannot see that UDP.
+
+**One-way evidence.** A TCP source address cannot be forged: the handshake completed. So
+`--no-enforce-one-way`, which exists because UDP sources can be, does not downgrade evidence
+that arrived over HEP with TCP transport. It still applies to wire UDP and to HEP over UDP.
+
+**Time.** Verdicts use the local receive time. A message whose HEP timestamp is more than
+5 seconds old is skipped as `stale`, so a replayed backlog cannot block for behaviour that is
+over.
+
+### Counters and alarms
+
+The periodic report has a `HEP:` line, and `tfps_ctl stats`, its `--json` form and `/metrics`
+(`tfps_traffic_total{counter="hep_…"}`) carry the same counters from the daemon's checkpoint:
+
+| counter | meaning |
+|---|---|
+| `hep_received` | datagrams read |
+| `hep_sip` | messages handed to the engine |
+| `hep_rejected_sender` | sender not in `allow_from` |
+| `hep_bad_auth` | `auth_key` missing or wrong |
+| `hep_malformed` | not HEP3, a length that lies, or a required chunk missing |
+| `hep_skipped_udp` / `hep_skipped_tcp` | a transport not in `transports` |
+| `hep_skipped_ipv6` | IPv6 (detection and enforcement are IPv4 only) |
+| `hep_skipped_proto` | not SIP (RTCP, logs, …), a compressed payload, or another transport |
+| `hep_stale` | captured more than 5 seconds before it arrived |
+| `hep_dropped` | the queue to the packet loop (4,096 messages or 16 MiB) was full |
+
+**Silence is an alarm, port by port.** With HEP on, if no message for a SIP port arrives for
+**5 minutes** while TCP packets are seen on that port, TFPS raises an `ALARM` naming it: the
+sender has stopped, or does not trace that port, and TLS / WSS there are blind again. While
+HEP delivers for a port, that port's TCP does not raise the "SIP over TCP it cannot inspect"
+warning. Only messages that arrived over TCP count, and only for their own port: a stream
+for 443 does not cover 5061, and HEP over UDP covers no TCP.
+
+### Limits
+
+- **Blocking on 443 blocks everything on 443** from that source, not only SIP.
+- **Shared addresses.** WebRTC clients are often behind carrier NAT; one block can affect
+  several users.
+- **Detection depends on the sender.** If OpenSIPS stops tracing, TFPS is blind on TLS / WSS
+  again (hence the silence alarm).
+- **Detection lags the application server** by the mirroring delay. That does not matter for
+  blocking a source.
+- **TLS / WSS terminated elsewhere** (a proxy, load balancer or CDN): TFPS on this host cannot
+  block the client, and the proxy must be in `ignoreip`.
+- HEP over UDP only (not TCP or TLS); HEP3 only; no compressed payloads; IPv4 only.
+
+---
+
 ## Reading the report
 
 ```
@@ -798,8 +922,8 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 
 | not handled | why |
 |---|---|
-| **SIP over TLS** | encrypted payload; only metadata and IP reputation remain |
-| **SIP over TCP — detection** | L7 reassembly is not implemented; content is not parsed. **Enforcement covers TCP** on the ports you list: a condemned source is dropped in XDP on those ports too, so add 5061 if you want TLS/TCP covered — new attacks over TCP/TLS are still not *detected* on the wire |
+| **SIP over TLS / WSS on the wire** | encrypted payload. Mirror it from the application server over HEP to have it judged — see "TLS and WebSocket via HEP" |
+| **SIP over TCP — detection on the wire** | L7 reassembly is not implemented; content is not parsed off the wire. HEP covers it, one whole message per packet. **Enforcement covers TCP** on the ports you list: a condemned source is dropped in XDP on those ports too, so add 5061 (and 443 for WSS) |
 | **IPv6** | the capture takes `ETH_P_IP` only; counted and warned about |
 | **IPv4 fragments** | not reassembled; any fragment (MF or offset) is counted and never judged. The softswitch may still reassemble the real message |
 | **802.1Q/QinQ tagged SIP** | XDP checks for EtherType 0x0800; run the tap on an untagged interface, or add tag handling before relying on enforcement there |
@@ -816,7 +940,8 @@ Documented, not engineered away — a limitation stated plainly beats one that f
 
 **TFPS cannot catch every possible type of fraud.** It is one layer that sees SIP on the
 wire. It does not see billing, CRM, provisioning, identity, social engineering, insider
-fraud, or traffic it cannot parse (SIP over TLS, SIP over TCP content, IPv6). A determined
+fraud, or traffic it cannot parse (SIP over TLS or TCP content not mirrored to it over HEP,
+IPv6). A determined
 low-and-slow attacker can mimic a legitimate profile. Behavioural detection is experimental
 and report-only by default (source-level XDP blocking is opt-in); every verdict can be
 wrong.
