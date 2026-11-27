@@ -12,7 +12,7 @@
 //! address the TCP handshake proved, so it is not one-way evidence.
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,9 +21,13 @@ use tfps_core::hep::{classify, parse, Filter, Skip, Transport};
 
 use crate::config::{HepConfig, HepTransport};
 
-/// How many messages may wait for the main loop. At a few hundred bytes each
-/// this bounds the queue to a few MiB.
+/// How many messages may wait for the main loop.
 pub const QUEUE: usize = 4096;
+
+/// How many payload bytes may wait for the main loop. One datagram can carry
+/// almost 64 KiB, so the message count alone would let an allowed sender hold
+/// about 256 MiB; this caps it at 16 MiB, whichever limit is reached first.
+pub const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
 /// A message captured more than this many seconds before it arrived is stale: a
 /// replayed backlog must not trigger blocks for behaviour that is over.
@@ -57,6 +61,9 @@ pub struct Counters {
     pub stale: AtomicU64,
     /// Dropped because the queue to the main loop was full.
     pub dropped: AtomicU64,
+    /// Payload bytes waiting in the queue: added by the listener, taken off by
+    /// the main loop as it receives.
+    queued_bytes: AtomicUsize,
 }
 
 impl Counters {
@@ -160,14 +167,24 @@ pub fn handle(
 }
 
 /// Offers a message to the main loop without waiting. Counts it as handed over,
-/// or as dropped when the queue is full. Returns false when the main loop is gone.
+/// or as dropped when the queue is full, by messages or by bytes. Returns false
+/// when the main loop is gone.
 pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> bool {
+    let len = m.payload.len();
+    // One listener thread adds; the main loop only subtracts. So the room seen
+    // here can only grow before the add below.
+    if counters.queued_bytes.load(Ordering::Acquire) + len > QUEUE_BYTES {
+        Counters::bump(&counters.dropped);
+        return true;
+    }
+    counters.queued_bytes.fetch_add(len, Ordering::AcqRel);
     match tx.try_send(m) {
         Ok(()) => {
             Counters::bump(&counters.sip);
             true
         }
         Err(TrySendError::Full(_)) => {
+            counters.queued_bytes.fetch_sub(len, Ordering::AcqRel);
             Counters::bump(&counters.dropped);
             true
         }
@@ -175,17 +192,47 @@ pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> b
     }
 }
 
+/// The main loop's end of the queue. Receiving a message gives its bytes back.
+pub struct Inbox {
+    rx: Receiver<Delivered>,
+    counters: Arc<Counters>,
+}
+
+impl Inbox {
+    pub fn new(rx: Receiver<Delivered>, counters: Arc<Counters>) -> Self {
+        Inbox { rx, counters }
+    }
+
+    /// The next waiting message, if any, without blocking.
+    pub fn try_recv(&self) -> Option<Delivered> {
+        let m = self.rx.try_recv().ok()?;
+        self.taken(&m);
+        Some(m)
+    }
+
+    /// The next message, waiting up to `timeout` for one.
+    pub fn recv_timeout(&self, timeout: std::time::Duration) -> Option<Delivered> {
+        let m = self.rx.recv_timeout(timeout).ok()?;
+        self.taken(&m);
+        Some(m)
+    }
+
+    fn taken(&self, m: &Delivered) {
+        self.counters
+            .queued_bytes
+            .fetch_sub(m.payload.len(), Ordering::AcqRel);
+    }
+}
+
 /// Binds the listener and starts its thread. A bind failure is returned, so the
 /// daemon can say so at startup instead of running without the input it was
 /// configured to have.
-pub fn spawn(
-    c: &HepConfig,
-    counters: Arc<Counters>,
-) -> std::io::Result<(Receiver<Delivered>, SocketAddr)> {
+pub fn spawn(c: &HepConfig, counters: Arc<Counters>) -> std::io::Result<(Inbox, SocketAddr)> {
     let sock = UdpSocket::bind(c.listen)?;
     let local = sock.local_addr()?;
     let settings = Settings::from_config(c);
     let (tx, rx) = mpsc::sync_channel(QUEUE);
+    let inbox = Inbox::new(rx, Arc::clone(&counters));
     std::thread::Builder::new()
         .name("tfps-hep".into())
         .spawn(move || {
@@ -210,7 +257,7 @@ pub fn spawn(
                 }
             }
         })?;
-    Ok((rx, local))
+    Ok((inbox, local))
 }
 
 #[cfg(test)]
@@ -354,6 +401,32 @@ mod tests {
         assert!(!offer(&tx, m, &c), "the main loop is gone");
     }
 
+    /// Large messages fill the byte budget before the message count, and
+    /// receiving one gives its bytes back.
+    #[test]
+    fn the_queue_is_bounded_by_bytes_too() {
+        let c = Arc::new(Counters::default());
+        let (tx, rx) = mpsc::sync_channel(QUEUE);
+        let inbox = Inbox::new(rx, Arc::clone(&c));
+        let big = Delivered {
+            src: CLIENT,
+            dst: SERVER,
+            src_port: None,
+            dst_port: None,
+            transport: Transport::Tcp,
+            payload: vec![b'x'; 60_000],
+        };
+        let fits = QUEUE_BYTES / big.payload.len();
+        for _ in 0..fits + 10 {
+            assert!(offer(&tx, big.clone(), &c));
+        }
+        assert_eq!(count(&c, "hep_sip"), fits as u64);
+        assert_eq!(count(&c, "hep_dropped"), 10, "dropped by bytes, not count");
+        assert!(inbox.try_recv().is_some());
+        assert!(offer(&tx, big, &c), "room again once one is taken");
+        assert_eq!(count(&c, "hep_sip"), fits as u64 + 1);
+    }
+
     /// The real socket: bind, send from loopback, receive on the channel.
     #[test]
     fn the_listener_receives_over_udp() {
@@ -363,7 +436,7 @@ mod tests {
             ..HepConfig::default()
         };
         let counters = Arc::new(Counters::default());
-        let (rx, addr) = spawn(&cfg, Arc::clone(&counters)).expect("binds");
+        let (inbox, addr) = spawn(&cfg, Arc::clone(&counters)).expect("binds");
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -372,7 +445,9 @@ mod tests {
         client
             .send_to(&packet(IPPROTO_TCP, now, None), addr)
             .unwrap();
-        let m = rx.recv_timeout(Duration::from_secs(5)).expect("delivered");
+        let m = inbox
+            .recv_timeout(Duration::from_secs(5))
+            .expect("delivered");
         assert_eq!(m.src, CLIENT);
         assert_eq!(count(&counters, "hep_sip"), 1);
     }

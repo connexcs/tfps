@@ -811,8 +811,9 @@ HEP is unauthenticated: whoever can send to the listener can get an address bloc
   is a startup `WARNING`;
 - packets from a sender not in `allow_from` are dropped and counted;
 - `auth_key` makes every packet carry that shared secret (HEP chunk 14);
-- `ignoreip`, the host's own addresses and registered peers shield HEP verdicts exactly as
-  they shield wire verdicts. **An upstream proxy or load balancer must be in `ignoreip`.**
+- `ignoreip` and the host's own addresses shield HEP verdicts exactly as they shield wire
+  verdicts. **An upstream proxy or load balancer must be in `ignoreip`.** (A registered peer
+  is not shielded from the perimeter's own evidence, on the wire or over HEP; see "Status".)
 
 **Transports.** By default only messages that arrived over **TCP** (which covers TLS, WS and
 WSS) are judged. OpenSIPS traces its UDP traffic too, which TFPS already sees on the wire;
@@ -843,12 +844,12 @@ The periodic report has a `HEP:` line, and `tfps_ctl stats`, its `--json` form a
 | `hep_skipped_ipv6` | IPv6 (detection and enforcement are IPv4 only) |
 | `hep_skipped_proto` | not SIP (RTCP, logs, …), a compressed payload, or another transport |
 | `hep_stale` | captured more than 5 seconds before it arrived |
-| `hep_dropped` | the queue to the packet loop (4,096 messages) was full |
+| `hep_dropped` | the queue to the packet loop (4,096 messages or 16 MiB) was full |
 
 **Silence is an alarm.** With HEP on, if nothing arrives for **5 minutes** while TCP packets
 are seen on the SIP ports, TFPS raises an `ALARM`: the sender has stopped and TLS / WSS are
 blind again. While HEP is delivering, the "SIP over TCP it cannot inspect" warning is not
-raised.
+raised. Only messages that arrived over TCP count as delivering: HEP over UDP covers no TCP.
 
 ### Limits
 

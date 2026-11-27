@@ -209,7 +209,7 @@ pub enum Skip {
     Tcp,
     /// Captured too long ago: a replayed backlog must not block for old behaviour.
     Stale,
-    /// A required chunk is missing (addresses, transport or payload).
+    /// A required chunk is missing (family, addresses, transport or payload).
     Incomplete,
 }
 
@@ -240,12 +240,13 @@ pub fn classify<'a>(hep: &Hep<'a>, f: &Filter<'_>) -> Result<Message<'a>, Skip> 
     if hep.proto_type != Some(PROTO_SIP) {
         return Err(Skip::Proto);
     }
+    // A compressed chunk makes the packet unsupported even beside a plain payload
+    // chunk: which of the two is the message is not this module's guess to make.
+    if hep.compressed {
+        return Err(Skip::Compressed);
+    }
     let Some(payload) = hep.payload else {
-        return Err(if hep.compressed {
-            Skip::Compressed
-        } else {
-            Skip::Incomplete
-        });
+        return Err(Skip::Incomplete);
     };
     let transport = match hep.ip_proto {
         Some(IPPROTO_TCP) => Transport::Tcp,
@@ -261,8 +262,11 @@ pub fn classify<'a>(hep: &Hep<'a>, f: &Filter<'_>) -> Result<Message<'a>, Skip> 
     let (Some(src), Some(dst)) = (hep.src, hep.dst) else {
         return Err(Skip::Incomplete);
     };
-    if hep.family.is_some_and(|fam| fam != FAMILY_V4) {
-        return Err(Skip::Proto);
+    match hep.family {
+        Some(FAMILY_V4) => {}
+        // Without the family chunk the addresses are not known to be IPv4.
+        None => return Err(Skip::Incomplete),
+        Some(_) => return Err(Skip::Proto),
     }
     if let Some(ts) = hep.ts_secs {
         if f.now.saturating_sub(ts) > f.stale_secs {
@@ -520,6 +524,20 @@ mod tests {
         let h = parse(&p).expect("valid");
         assert!(h.compressed);
         assert_eq!(classify(&h, &filter()), Err(Skip::Compressed));
+        // Beside a plain payload chunk too: the packet is still not one this reads.
+        let both = packet(&[
+            chunk(1, &[2]),
+            chunk(2, &[IPPROTO_TCP]),
+            chunk(3, &CLIENT.octets()),
+            chunk(4, &SERVER.octets()),
+            chunk(11, &[PROTO_SIP]),
+            chunk(15, b"OPTIONS sip:x SIP/2.0\r\n\r\n"),
+            chunk(16, b"\x1f\x8b\x08\x00"),
+        ]);
+        assert_eq!(
+            classify(&parse(&both).unwrap(), &filter()),
+            Err(Skip::Compressed)
+        );
     }
 
     #[test]
@@ -543,6 +561,18 @@ mod tests {
         assert_eq!(
             classify(&parse(&no_proto).unwrap(), &filter()),
             Err(Skip::Incomplete)
+        );
+        let no_family = packet(&[
+            chunk(2, &[IPPROTO_TCP]),
+            chunk(3, &CLIENT.octets()),
+            chunk(4, &SERVER.octets()),
+            chunk(11, &[PROTO_SIP]),
+            chunk(15, b"x"),
+        ]);
+        assert_eq!(
+            classify(&parse(&no_family).unwrap(), &filter()),
+            Err(Skip::Incomplete),
+            "IPv4 addresses without the family chunk are not trusted as IPv4"
         );
     }
 

@@ -908,12 +908,17 @@ fn main() -> ExitCode {
 
         // Mirrored SIP from the HEP listener. Bounded per pass, so a flood of it
         // cannot starve the wire capture.
-        if let Some(rx) = hep_rx.as_ref() {
-            for m in rx.try_iter().take(tfps::hep::QUEUE) {
-                hep_last = t.0;
-                hep_ever = true;
-                tcp_at_hep_last = n_tcp;
-                hep_silence_warned = false;
+        if let Some(inbox) = hep_rx.as_ref() {
+            for m in std::iter::from_fn(|| inbox.try_recv()).take(tfps::hep::QUEUE) {
+                // Only TCP mirrors cover the wire's TCP blind spot: HEP over UDP,
+                // when accepted, neither suppresses that warning nor resets the
+                // silence alarm.
+                if m.transport == tfps_core::hep::Transport::Tcp {
+                    hep_last = t.0;
+                    hep_ever = true;
+                    tcp_at_hep_last = n_tcp;
+                    hep_silence_warned = false;
+                }
                 // The server's side of the exchange: where a request went, or where
                 // an answer came from.
                 let is_response = m.payload.starts_with(b"SIP/2.0 ");
@@ -1230,7 +1235,7 @@ impl Blocker for xdp::Enforcer {
 enum Outcome {
     /// Nothing was tripped.
     Ignored,
-    /// Tripped a rule, but `ignoreip`, a host address or a registered peer covers it.
+    /// Tripped a rule, but `ignoreip` or a host address covers it.
     Exempt,
     /// Condemned while observing only, or one-way evidence under `--no-enforce-one-way`.
     WouldBlock,
@@ -1243,6 +1248,10 @@ enum Outcome {
 /// From a verdict to an action: the one path that packets off the wire and
 /// messages mirrored over HEP share, so both get the same gate, the same block
 /// and the same audit row.
+///
+/// A registered peer is not shielded here, on either path: its own perimeter
+/// evidence still counts (see the comment on `enforcing` below). The gate is
+/// `ignoreip`, which holds the host's own addresses.
 ///
 /// `spoofable` says whether the subject's address could have been forged. On the
 /// wire (UDP) it could, so `--no-enforce-one-way` keeps request-only evidence
