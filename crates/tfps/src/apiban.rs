@@ -220,14 +220,18 @@ impl ureq::unversioned::resolver::Resolver for HookResolver {
         &self,
         uri: &ureq::http::Uri,
         _config: &ureq::config::Config,
-        _timeout: ureq::unversioned::transport::NextTimeout,
+        timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
         let (host, port) = host_port(uri)?;
         let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        // One deadline for the whole lookup, A and AAAA and every nameserver,
+        // inside what the client has left: a slow DNS must not hold the URL's
+        // only delivery worker past its timeout.
+        let deadline = std::time::Instant::now() + lookup_budget(timeout.not_zero().map(|d| *d));
         let ips = hook_addresses(host, &hosts, |name| {
-            let v4 = dns::resolve(name, dns::A, Duration::from_secs(5));
+            let v4 = dns::resolve(name, dns::A, deadline);
             if v4.is_empty() {
-                dns::resolve(name, dns::AAAA, Duration::from_secs(5))
+                dns::resolve(name, dns::AAAA, deadline)
             } else {
                 v4
             }
@@ -242,6 +246,13 @@ impl ureq::unversioned::resolver::Resolver for HookResolver {
         }
         Ok(out)
     }
+}
+
+/// How long a lookup may take: what the HTTP client has left (`None`: no limit),
+/// and never more than five seconds.
+fn lookup_budget(left: Option<Duration>) -> Duration {
+    const MAX: Duration = Duration::from_secs(5);
+    left.map_or(MAX, |l| l.min(MAX))
 }
 
 /// The addresses for `host`, as [`HookResolver`] finds them, with `hosts` the
@@ -298,9 +309,7 @@ impl ureq::unversioned::resolver::Resolver for MuslSafeResolver {
             out.push(SocketAddr::new(ip, port));
             return Ok(out);
         }
-        // A fixed lookup budget; ureq's own global timeout still bounds the whole call.
-        let _ = timeout;
-        match dns::resolve_a(host, Duration::from_secs(5)) {
+        match dns::resolve_a(host, lookup_budget(timeout.not_zero().map(|d| *d))) {
             Some(ip) => {
                 out.push(SocketAddr::new(IpAddr::V4(ip), port));
                 Ok(out)
@@ -313,7 +322,7 @@ impl ureq::unversioned::resolver::Resolver for MuslSafeResolver {
 /// A minimal DNS A-record client, so resolution never touches `getaddrinfo`.
 mod dns {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     /// Real nameservers, skipping the systemd-resolved stub the C library cannot use, with
     /// public fallbacks so a broken `resolv.conf` still resolves.
@@ -352,7 +361,7 @@ mod dns {
 
     /// Looks up the first IPv4 for `host`, trying each nameserver until one answers.
     pub fn resolve_a(host: &str, timeout: Duration) -> Option<Ipv4Addr> {
-        resolve(host, A, timeout)
+        resolve(host, A, Instant::now() + timeout)
             .into_iter()
             .find_map(|ip| match ip {
                 IpAddr::V4(v4) => Some(v4),
@@ -360,11 +369,50 @@ mod dns {
             })
     }
 
+    /// A query id nobody off the path can guess: two bytes from the kernel's
+    /// random source, or, failing that, from a randomly keyed hash.
+    fn query_id() -> u16 {
+        let mut b = [0u8; 2];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))
+            .is_ok()
+        {
+            return u16::from_be_bytes(b);
+        }
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u128(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        );
+        h.finish() as u16
+    }
+
+    /// Whether `resp` answers `query`: the same id, marked as a response to a
+    /// standard query with no error, and asking the same single question. The
+    /// name is compared without regard to case, which some servers vary.
+    pub(super) fn answers(query: &[u8], resp: &[u8]) -> bool {
+        resp.len() >= query.len()
+            && resp[..2] == query[..2]
+            && resp[2] & 0x80 != 0 // a response
+            && resp[2] & 0x78 == 0 // to a standard query
+            && resp[3] & 0x0f == 0 // with no error
+            && resp[4..6] == [0, 1] // one question
+            && resp[12..query.len()].eq_ignore_ascii_case(&query[12..])
+    }
+
     /// Every address of record type `qtype` (`A` or `AAAA`) for `host`, from the
-    /// first nameserver that answers with any.
-    pub fn resolve(host: &str, qtype: u16, timeout: Duration) -> Vec<IpAddr> {
+    /// first nameserver that answers with any, all by `deadline`.
+    ///
+    /// Each query has a random id and goes over a socket connected to that one
+    /// nameserver, and a reply counts only if it [`answers`] the query: a forged
+    /// reply has to guess the id and the port, and come from the server's address.
+    pub fn resolve(host: &str, qtype: u16, deadline: Instant) -> Vec<IpAddr> {
         let mut q: Vec<u8> = Vec::with_capacity(64);
-        q.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        q.extend_from_slice(&query_id().to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
         for label in host.split('.').filter(|l| !l.is_empty()) {
             if label.len() > 63 {
                 return Vec::new();
@@ -377,20 +425,39 @@ mod dns {
         q.extend_from_slice(&[0x00, 0x01]); // class IN
 
         for ns in nameservers() {
-            let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
+            let left = || {
+                deadline
+                    .checked_duration_since(Instant::now())
+                    .filter(|d| !d.is_zero())
+            };
+            if left().is_none() {
+                break;
+            }
+            let local = if ns.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+            let Ok(sock) = UdpSocket::bind(local) else {
                 continue;
             };
-            let _ = sock.set_read_timeout(Some(timeout));
-            if sock.send_to(&q, SocketAddr::new(ns, 53)).is_err() {
+            // Connected: the kernel drops datagrams from any other address.
+            if sock.connect(SocketAddr::new(ns, 53)).is_err() || sock.send(&q).is_err() {
                 continue;
             }
             let mut buf = [0u8; 512];
-            let Ok(n) = sock.recv(&mut buf) else {
-                continue;
-            };
-            let found = records(&buf[..n], qtype);
-            if !found.is_empty() {
-                return found;
+            // Read until an answer to this query arrives or the time is up; a
+            // datagram that does not answer it is ignored, not believed.
+            while let Some(wait) = left() {
+                if sock.set_read_timeout(Some(wait)).is_err() {
+                    break;
+                }
+                let Ok(n) = sock.recv(&mut buf) else {
+                    break;
+                };
+                if answers(&q, &buf[..n]) {
+                    let found = records(&buf[..n], qtype);
+                    if !found.is_empty() {
+                        return found;
+                    }
+                    break; // this server has none; try the next
+                }
             }
         }
         Vec::new()
@@ -489,6 +556,51 @@ mod dns {
             }
         }
 
+        /// A reply is believed only if it answers this query.
+        #[test]
+        fn only_a_reply_to_this_query_is_believed() {
+            let mut query = vec![0xab, 0xcd, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+            query.extend_from_slice(&[4, b'h', b'o', b'o', b'k', 0, 0, 1, 0, 1]);
+            let reply = |f: &dyn Fn(&mut Vec<u8>)| {
+                let mut r = query.clone();
+                r[2] = 0x81; // response, recursion desired
+                r[3] = 0x80; // recursion available, no error
+                r.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+                r[7] = 1; // one answer
+                f(&mut r);
+                r
+            };
+            assert!(answers(&query, &reply(&|_| {})));
+            assert!(
+                answers(&query, &reply(&|r| r[13] = b'H')),
+                "the name's case may differ"
+            );
+            for (why, bad) in [
+                ("another id", reply(&|r| r[1] ^= 1)),
+                ("not a response", reply(&|r| r[2] &= 0x7f)),
+                ("an error", reply(&|r| r[3] |= 0x03)),
+                ("another name", reply(&|r| r[14] = b'x')),
+                ("another type", reply(&|r| r[19] = 28)),
+                ("two questions", reply(&|r| r[5] = 2)),
+                ("cut short", query[..10].to_vec()),
+            ] {
+                assert!(!answers(&query, &bad), "{why}");
+            }
+        }
+
+        #[test]
+        fn query_ids_are_not_fixed() {
+            let ids: std::collections::HashSet<u16> = (0..8).map(|_| query_id()).collect();
+            assert!(ids.len() > 1, "{ids:?}");
+        }
+
+        #[test]
+        fn a_lookup_past_its_deadline_asks_nobody() {
+            let started = Instant::now();
+            assert!(resolve("example.com", A, started).is_empty());
+            assert!(started.elapsed() < Duration::from_millis(50));
+        }
+
         #[test]
         fn parses_every_aaaa_record_and_only_the_type_asked_for() {
             // 1 question, 3 answers: AAAA 2001:db8::1, A 1.2.3.4, AAAA 2001:db8::2.
@@ -566,6 +678,19 @@ fn between(s: &str, open: char, close: char) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lookup_never_outlasts_the_client_nor_five_seconds() {
+        assert_eq!(lookup_budget(None), Duration::from_secs(5));
+        assert_eq!(
+            lookup_budget(Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            lookup_budget(Some(Duration::from_secs(60))),
+            Duration::from_secs(5)
+        );
+    }
 
     #[test]
     fn a_hook_host_resolves_from_etc_hosts_before_dns() {
