@@ -207,6 +207,7 @@ pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> b
         }
         Err(TrySendError::Disconnected(_)) => {
             counters.sip.fetch_sub(1, Ordering::Relaxed);
+            counters.queued_bytes.fetch_sub(len, Ordering::AcqRel);
             false
         }
     }
@@ -510,7 +511,14 @@ mod tests {
         assert_eq!(count(&c, "hep_sip"), 1);
         assert_eq!(count(&c, "hep_dropped"), 1);
         drop(rx);
+        let queued = c.queued_bytes.load(Ordering::Acquire);
         assert!(!offer(&tx, m, &c), "the main loop is gone");
+        assert_eq!(count(&c, "hep_sip"), 1, "not counted as handed over");
+        assert_eq!(
+            c.queued_bytes.load(Ordering::Acquire),
+            queued,
+            "nor as queued"
+        );
     }
 
     /// Large messages fill the byte budget before the message count, and
