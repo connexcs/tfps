@@ -1222,18 +1222,51 @@ fn forget(args: &Args) -> Result<(), String> {
 /// Off unless the configuration enables it, and then it says so and exits 0, so
 /// the unit can be installed and left alone without systemd restarting it.
 fn serve(args: &Args) -> Result<(), String> {
-    let (http, config_db) = match tfps::config::load(&args.config) {
-        tfps::config::Loaded::File(c, _) => (c.http.unwrap_or_default(), c.db),
-        tfps::config::Loaded::Absent => (tfps::config::HttpConfig::default(), None),
+    let (http, config_db, hooks, poll) = match tfps::config::load(&args.config) {
+        tfps::config::Loaded::File(c, _) => {
+            (c.http.unwrap_or_default(), c.db, c.hooks, c.hooks_poll_secs)
+        }
+        tfps::config::Loaded::Absent => {
+            (tfps::config::HttpConfig::default(), None, Vec::new(), None)
+        }
         // A broken file must not quietly turn into "the API is off".
         tfps::config::Loaded::Broken(e) => return Err(e),
     };
-    let Some((listen, opts)) = serve_settings(&http, args.listen, args.allow_unban)? else {
+    let bad = tfps::config::bad_hooks(&hooks);
+    if !bad.is_empty() {
+        return Err(format!("hooks must be http:// or https:// URLs: {bad:?}"));
+    }
+    let api = serve_settings(&http, args.listen, args.allow_unban)?;
+    if api.is_none() && hooks.is_empty() {
         say!(
-            "the HTTP API is off: set \"http\": {{\"enabled\": true}} in {} to serve it",
+            "the HTTP API and webhooks are off: set \"http\": {{\"enabled\": true}} or \
+             \"hooks\": [...] in {} to serve them",
             args.config.display()
         );
         return Ok(());
+    }
+    let ctx = serve_ctx(args, config_db);
+
+    // Webhooks run beside the API, or on their own when the API is off.
+    let stats =
+        (!hooks.is_empty()).then(|| std::sync::Arc::new(tfps::hooks::Stats::new(hooks.len())));
+    let watcher = stats.as_ref().map(|stats| {
+        let (ctx, stats) = (ctx.clone(), std::sync::Arc::clone(stats));
+        let every = std::time::Duration::from_secs(poll.unwrap_or(1).max(1));
+        eprintln!(
+            "tfps_ctl serve: sending webhooks to {} URL(s), checking every {}s",
+            hooks.len(),
+            every.as_secs()
+        );
+        std::thread::spawn(move || tfps::hooks::run(&ctx, &hooks, every, stats))
+    });
+
+    let Some((listen, opts)) = api else {
+        // Hooks only: run until stopped.
+        if let Some(w) = watcher {
+            let _ = w.join();
+        }
+        return Err("the webhook sender stopped".into());
     };
     let listener =
         std::net::TcpListener::bind(listen).map_err(|e| format!("listening on {listen}: {e}"))?;
@@ -1246,7 +1279,7 @@ fn serve(args: &Args) -> Result<(), String> {
     );
     tfps::api::serve(
         listener,
-        std::sync::Arc::new(tfps::api::CtlBackend(serve_ctx(args, config_db))),
+        std::sync::Arc::new(tfps::api::CtlBackend(ctx, stats)),
         opts,
     )
     .map_err(|e| format!("serving: {e}"))

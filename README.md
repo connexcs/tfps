@@ -357,12 +357,14 @@ integrations. Never **policy** configuration, which would say what fraud is.
   "iface": "eth0",
   "db": "/var/lib/tfps/tfps.db",
 
-  "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false }
+  "http": { "enabled": false, "listen": "127.0.0.1:9060", "allow_unban": false },
+  "hooks": [],
+  "hooks_poll_secs": 1
 }
 ```
 
-`http` configures the optional JSON API (`tfps_ctl serve`); the daemon ignores it. See
-"JSON API" below.
+`http` configures the optional JSON API and `hooks` the optional webhooks, both served by
+`tfps_ctl serve`; the daemon ignores them. See "JSON API" and "Webhooks" below.
 
 Precedence: **command line > file > built-in default**, so you can debug in production
 without editing a file. An **unknown field is an error**, not silence: an `apiban_kei`
@@ -683,7 +685,63 @@ scrape_configs:
       - targets: ["127.0.0.1:9060"]
 ```
 
-Block, unblock and expiry webhooks are planned (issue #1), and will come from the same process.
+## Webhooks
+
+TFPS can POST a JSON document to one or more URLs when a source is **blocked**, **unblocked**,
+or its block **expires**, for a control panel, a ticketing tool or a chat bridge. They are sent
+by the same `tfps_ctl serve` process as the JSON API, never by the daemon, so the packet path
+gains no HTTP client. Configure the URLs and enable the unit (it runs for webhooks even with the
+API off):
+
+```json
+"hooks": ["https://panel.example.com/tfps/events", "http://127.0.0.1:8080/hook"],
+"hooks_poll_secs": 1
+```
+
+```sh
+systemctl enable --now tfps-api      # and `systemctl restart tfps-api` after editing hooks
+```
+
+Every URL receives every event:
+
+```json
+{"event":"block","ip":"203.0.113.9","ts":1795000000,"reason":"auth_failure","detail":"…","expires":1795003600,"source":"tfps","host":"sbc1"}
+```
+
+| `event` | when | `source` |
+|---|---|---|
+| `block` | the daemon blocks a source (a new `block_log` row), or a manual ban is recorded | `tfps`, or who banned (`reason` is `manual`, `detail` their reason) |
+| `unblock` | a manual unban is recorded (`tfps_ctl unban`, `POST /v1/unban`) | who unbanned, with their `reason` |
+| `expired` | a watched block's expiry time has passed | `tfps` |
+| `unblock` | a watched block left the map early with no unban on record | `unknown` |
+
+`ts` and `expires` are Unix times; `expires` is `null` for a block with no expiry and on the end
+of a block. `host` is this machine's name.
+
+**Delivery.** Each URL has its own worker and a queue of 1,000 events, so a slow or dead
+endpoint delays no other. An event is POSTed with a 5-second timeout and retried after 1, 2 and
+4 seconds; then it is dropped and counted. `/metrics` exports
+`tfps_hook_deliveries_total{url_index,result="delivered|failed|queue_full"}`. Where reading
+stopped is kept in `/var/lib/tfps/hooks.cursor`, saved only when every queued event has been
+delivered or given up on, so a restart never skips what was written meanwhile; events still
+queued when `serve` stopped are sent again after it starts (at-least-once). The first start
+begins at the current end.
+
+**Known limits.**
+
+- **Expiry is noticed by polling** (`hooks_poll_secs`, default 1 s), because expiry happens in
+  the kernel: an `expired` event is accurate to the poll interval.
+- **An address that vanishes early with no unban** — the map's LRU eviction under a
+  spoofed-source flood, or another program editing a shared map — is reported as `unblock` with
+  `"source":"unknown"`, one poll late (so an unban whose record is still being written is not
+  misreported), never silently dropped.
+- **Expiries are not replayed across a restart** of `serve` or of the daemon: blocks that
+  expired meanwhile produce no event. The first poll after either only takes a baseline.
+- **APIBAN feed blocks fire no webhooks** (thousands per sync, and not this host's own
+  evidence).
+- Delivery is **at-least-once within the retry budget**, not guaranteed. Events are not
+  signed; put the receiver behind TLS and authenticate it by network or URL secret until
+  signing is added.
 
 ---
 

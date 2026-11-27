@@ -90,6 +90,10 @@ turn the API off) run `systemctl restart tfps-api`: restarting `tfps` does not r
 It reads blocks from the map the running daemon publishes in `/run/tfps/state.json`, so
 after upgrading from a version without that file, restart `tfps` too. For machine clients,
 set `token_file` (owner-readable only); to listen beyond loopback, set `allow_remote`.
+
+**Webhooks** (`"hooks": ["https://…"]`, README "Webhooks") are sent by the same
+`tfps-api.service`, which runs for them even with the API off: set them, then
+`systemctl enable --now tfps-api` (or `systemctl restart tfps-api` after editing them).
 Read the README's "JSON API" section, its security model in particular, before exposing it.
 
 ## Pinning a version

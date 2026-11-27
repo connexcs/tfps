@@ -129,6 +129,48 @@ pub struct Config {
     /// The optional JSON-over-HTTP API served by `tfps_ctl serve`. The daemon
     /// itself ignores this section: the API is a separate process.
     pub http: Option<HttpConfig>,
+    /// Webhook URLs (`http://` or `https://`), each POSTed a JSON document when
+    /// a source is blocked, unblocked, or its block expires. Sent by
+    /// `tfps_ctl serve`, never by the daemon. Empty: no webhooks.
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    /// How often, in seconds, `tfps_ctl serve` looks for new events. Default 1.
+    pub hooks_poll_secs: Option<u64>,
+}
+
+/// The webhook URLs that are not `http://` or `https://` URLs with a host, as
+/// the HTTP client that sends them parses them (so a bad port or a space is
+/// refused at start, not at the first event). A typo here would otherwise send
+/// nothing, silently.
+pub fn bad_hooks(hooks: &[String]) -> Vec<&str> {
+    hooks
+        .iter()
+        .filter(|u| {
+            let Ok(uri) = u.parse::<ureq::http::Uri>() else {
+                return true;
+            };
+            let scheme_ok = matches!(uri.scheme_str(), Some("http" | "https"));
+            let host_ok = uri.host().is_some_and(|h| !h.is_empty());
+            // The parser reads a port lazily, so a non-numeric one passes it:
+            // whatever follows the host's last `:` must be a port number.
+            let port_ok = uri.authority().is_some_and(|a| {
+                let hostport = a.as_str().rsplit('@').next().unwrap_or("");
+                match hostport.strip_prefix('[') {
+                    Some(v6) => v6.split_once(']').is_some_and(|(_, rest)| {
+                        rest.is_empty()
+                            || rest
+                                .strip_prefix(':')
+                                .is_some_and(|p| p.parse::<u16>().is_ok())
+                    }),
+                    None => hostport
+                        .rsplit_once(':')
+                        .is_none_or(|(_, p)| p.parse::<u16>().is_ok()),
+                }
+            });
+            !(scheme_ok && host_ok && port_ok)
+        })
+        .map(String::as_str)
+        .collect()
 }
 
 /// Where the default listener goes: loopback only, so nothing is reachable
@@ -381,6 +423,29 @@ mod tests {
         assert!(
             parse(r#"{"http": {"listen": "127.0.0.1"}}"#).is_err(),
             "a port is required"
+        );
+    }
+
+    #[test]
+    fn hooks_are_off_by_default_and_must_be_http_urls() {
+        let c = parse("{}").expect("empty");
+        assert!(c.hooks.is_empty() && c.hooks_poll_secs.is_none());
+        let c = parse(r#"{"hooks": ["https://panel.example.com/tfps/events", "http://127.0.0.1:8080/hook", "https://[::1]:8443/h"], "hooks_poll_secs": 5}"#)
+            .expect("parses");
+        assert_eq!(c.hooks.len(), 3);
+        assert_eq!(c.hooks_poll_secs, Some(5));
+        assert!(bad_hooks(&c.hooks).is_empty());
+        let bad = vec![
+            "ftp://x/y".to_string(),
+            "panel.example.com/hook".to_string(),
+            "https:///nohost".to_string(),
+            "http://has space/x".to_string(),
+            "https://panel.example:bad-port/hook".to_string(),
+            "https://panel.example/a path".to_string(),
+        ];
+        assert_eq!(
+            bad_hooks(&bad),
+            bad.iter().map(String::as_str).collect::<Vec<_>>()
         );
     }
 

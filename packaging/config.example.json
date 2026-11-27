@@ -14,5 +14,6 @@
     "allow_unban": false,
     "hosts": [],
     "allow_remote": false
-  }
+  },
+  "hooks": []
 }
