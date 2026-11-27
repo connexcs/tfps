@@ -668,6 +668,13 @@ browser's light or dark setting and fits a phone.
   `Authorization: Bearer`. Every data route still needs it.
 - **The `Host` check applies to the page as to everything else**, so open it by an address
   the API answers to (behind a proxy, add the proxy's name to `hosts`).
+- **Behind a proxy with its own login** (HAProxy, nginx or Caddy with HTTP Basic auth), the
+  browser re-sends that login on the page's requests (same origin only). Let the proxy's
+  login guard the API and leave `token_file` unset: a browser sends one `Authorization`
+  header, and once a TFPS token is entered, that header is the token, not the proxy's login,
+  so the proxy refuses. The page tells the two apart: TFPS asks for its token, while a 401
+  from the proxy shows "The proxy in front of this API refused the request". To keep both, the
+  proxy has to authenticate some other way (a client certificate, or a login cookie).
 - The page is sent with a strict `Content-Security-Policy` (its own script and stylesheet
   only, no inline code, requests only to this API, no framing), and the script writes every
   value as text, never as HTML: block details are often attacker-chosen SIP text.

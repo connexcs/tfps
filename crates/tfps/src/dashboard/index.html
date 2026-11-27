@@ -35,6 +35,15 @@
     <p class="error" id="auth-error" hidden></p>
   </section>
 
+  <section id="proxy-auth" class="card notice" hidden>
+    <h2>The proxy in front of this API refused the request</h2>
+    <p>A server between this browser and TFPS (HAProxy, nginx, Caddy…) answered
+      <code>401</code> and asked for its own login, not TFPS's token. Reload the page to log in
+      to it again. If TFPS also has a <code>token_file</code>, the proxy must pass TFPS's
+      <code>Authorization: Bearer</code> header on, or leave <code>token_file</code> unset and
+      let the proxy's login guard the API.</p>
+  </section>
+
   <section class="kpis" aria-label="Summary">
     <div class="card kpi"><span class="label">Blocked now</span><span class="value" id="k-blocked">–</span><span class="sub" id="k-blocked-sub"></span></div>
     <div class="card kpi"><span class="label">Dropped by XDP</span><span class="value" id="k-dropped">–</span><span class="sub" id="k-dropped-sub"></span></div>

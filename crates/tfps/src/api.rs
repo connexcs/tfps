@@ -1777,6 +1777,11 @@ mod tests {
         for file in [DASHBOARD_HTML, DASHBOARD_CSS, DASHBOARD_JS] {
             assert!(!file.contains("://"), "every reference is same-origin");
         }
+        // Behind a proxy with its own login (HTTP Basic), the browser must
+        // re-send it on the page's requests, and to this origin only.
+        assert!(DASHBOARD_JS.contains(r#"credentials: "same-origin""#));
+        assert!(!DASHBOARD_JS.contains(r#"credentials: "omit""#));
+        assert!(!DASHBOARD_JS.contains(r#"credentials: "include""#));
         assert!(
             !DASHBOARD_HTML.contains("<script>") && !DASHBOARD_HTML.contains("style="),
             "no inline script or style, which the policy would block"

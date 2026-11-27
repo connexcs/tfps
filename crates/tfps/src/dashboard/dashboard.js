@@ -78,14 +78,29 @@ function token() {
   }
 }
 
-class AuthError extends Error {}
+// A 401. TFPS's own says `WWW-Authenticate: Bearer` and means its token is
+// missing or wrong; any other 401 came from a proxy in front of it (HAProxy,
+// nginx, Caddy with a password), and no token typed here will satisfy it.
+class AuthError extends Error {
+  constructor(message, proxy) {
+    super(message);
+    this.proxy = proxy;
+  }
+}
 
 async function api(path) {
   const headers = { Accept: "application/json" };
   const t = token();
   if (t) headers.Authorization = "Bearer " + t;
-  const r = await fetch(path, { headers, cache: "no-store", credentials: "omit" });
-  if (r.status === 401) throw new AuthError("the API needs a token");
+  // same-origin: the browser re-sends a login a proxy in front of this page
+  // asked for (HTTP Basic), and its cookies, to this origin only. "omit" would
+  // strip them and every request would be refused by the proxy.
+  const r = await fetch(path, { headers, cache: "no-store", credentials: "same-origin" });
+  if (r.status === 401) {
+    const challenge = (r.headers.get("WWW-Authenticate") || "").trim().toLowerCase();
+    const ours = challenge === "bearer" || challenge.startsWith("bearer ");
+    throw new AuthError(ours ? "the API needs a token" : "a proxy in front of the API refused the request", !ours);
+  }
   let body = null;
   try {
     body = await r.json();
@@ -298,7 +313,15 @@ function renderLog(rows) {
 
 function needToken(on, message) {
   $("auth").hidden = !on;
+  $("proxy-auth").hidden = true;
   showError("auth-error", on && token() ? new Error(message || "that token was refused") : null);
+}
+
+// A proxy, not TFPS, refused: a token typed here would not help (and would
+// replace the proxy's login on every request), so say what to do instead.
+function needProxyLogin(on) {
+  $("proxy-auth").hidden = !on;
+  if (on) $("auth").hidden = true;
 }
 
 async function refresh() {
@@ -319,10 +342,15 @@ async function refreshAs(gen) {
   const [status, stats, log, blocks] = await Promise.allSettled(jobs);
   if (gen !== generation) return; // superseded by a newer refresh
   const results = [status, stats, log, blocks].filter(Boolean);
-  if (results.some((r) => r.status === "rejected" && r.reason instanceof AuthError)) {
+  const refused = results
+    .filter((r) => r.status === "rejected" && r.reason instanceof AuthError)
+    .map((r) => r.reason);
+  if (refused.length) {
     // Nothing on the page can be read any more: say so, rather than keep the
-    // last answers on screen as if they were current.
-    needToken(true);
+    // last answers on screen as if they were current. Say who refused: TFPS
+    // wants its token; a proxy wants its own login, which a token cannot give.
+    if (refused.some((e) => e.proxy)) needProxyLogin(true);
+    else needToken(true);
     statusUnknown();
     lastUpdate = 0;
     showUpdated();
