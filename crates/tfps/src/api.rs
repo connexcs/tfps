@@ -216,6 +216,25 @@ pub struct Response {
 
 const JSON: &str = "application/json";
 const PROMETHEUS: &str = "text/plain; version=0.0.4; charset=utf-8";
+const HTML: &str = "text/html; charset=utf-8";
+
+/// The dashboard: one page, its stylesheet and its script, built into the
+/// binary. They hold no data; the script reads the `/v1` routes like any
+/// other client, from the same origin, under the same `Host` check and token.
+const DASHBOARD_HTML: &str = include_str!("dashboard/index.html");
+const DASHBOARD_CSS: &str = include_str!("dashboard/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("dashboard/dashboard.js");
+
+/// The routes of the dashboard's own files: served without the token (the
+/// page has to load before it can ask for one), and read-only.
+const DASHBOARD_FILES: [&str; 3] = ["/", "/dashboard.css", "/dashboard.js"];
+
+/// What the dashboard page may load: only its own stylesheet and script, and
+/// only this API to talk to. No inline script or style, nothing from another
+/// origin, no frames, no forms sent anywhere.
+const DASHBOARD_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; \
+     connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'none'; \
+     frame-ancestors 'none'";
 
 impl Response {
     fn json(status: u16, body: String) -> Self {
@@ -293,6 +312,12 @@ impl Response {
         }
         if self.challenge {
             head.push_str("WWW-Authenticate: Bearer\r\n");
+        }
+        if self.content_type == HTML {
+            head.push_str(&format!(
+                "Content-Security-Policy: {DASHBOARD_CSP}\r\n\
+                 X-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\n"
+            ));
         }
         head.push_str("\r\n");
         head.into_bytes()
@@ -678,7 +703,8 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
             .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
             .map(|(_, t)| t.trim());
         let ok = given.is_some_and(|t| same_secret(t.as_bytes(), token.as_bytes()));
-        if !ok && req.path != "/v1/health" {
+        let open = req.path == "/v1/health" || DASHBOARD_FILES.contains(&req.path.as_str());
+        if !ok && !open {
             return Response::unauthorized();
         }
     }
@@ -689,7 +715,18 @@ pub fn route(req: &Request, backend: &dyn Backend, opts: &Options) -> Response {
             Response::method_not_allowed("GET")
         }
     };
+    let file = |content_type: &'static str, body: &'static str| Response {
+        status: 200,
+        content_type,
+        body: body.to_string(),
+        allow: None,
+        challenge: false,
+        docs: None,
+    };
     match req.path.as_str() {
+        "/" => get_only(&|| file(HTML, DASHBOARD_HTML)),
+        "/dashboard.css" => get_only(&|| file("text/css; charset=utf-8", DASHBOARD_CSS)),
+        "/dashboard.js" => get_only(&|| file("text/javascript; charset=utf-8", DASHBOARD_JS)),
         "/v1/health" => get_only(&|| health()),
         "/v1/status" => get_only(&|| Response::json(200, to_json(&backend.status()))),
         "/v1/stats" => get_only(&|| match backend.stats() {
@@ -1679,6 +1716,98 @@ mod tests {
         );
     }
 
+    /// The dashboard is three files at fixed paths, each with its own type. The
+    /// page carries a policy that lets it load only those files and talk only to
+    /// this API.
+    #[test]
+    fn the_dashboard_is_served_with_a_strict_policy() {
+        let page = route(&get("/"), &up(), &off());
+        assert_eq!((page.status, page.content_type), (200, HTML));
+        assert!(page
+            .body
+            .contains("<script src=\"/dashboard.js\"></script>"));
+        let head = String::from_utf8(page.head()).unwrap();
+        assert!(
+            head.contains(&format!("\r\nContent-Security-Policy: {DASHBOARD_CSP}\r\n")),
+            "{head}"
+        );
+        assert!(head.contains("\r\nX-Frame-Options: DENY\r\n"));
+        assert!(head.contains("\r\nX-Content-Type-Options: nosniff\r\n"));
+        assert!(DASHBOARD_CSP.contains("script-src 'self';"));
+        assert!(
+            !DASHBOARD_CSP.contains("unsafe"),
+            "no inline script or style"
+        );
+
+        let css = route(&get("/dashboard.css"), &up(), &off());
+        assert_eq!(
+            (css.status, css.content_type),
+            (200, "text/css; charset=utf-8")
+        );
+        let js = route(&get("/dashboard.js"), &up(), &off());
+        assert_eq!(
+            (js.status, js.content_type),
+            (200, "text/javascript; charset=utf-8")
+        );
+        assert!(
+            !String::from_utf8(js.head())
+                .unwrap()
+                .contains("Content-Security-Policy"),
+            "the policy belongs to the page"
+        );
+
+        let mut post = get("/");
+        post.method = "POST".into();
+        assert_eq!(route(&post, &up(), &on()).status, 405, "read-only");
+    }
+
+    /// Block details are often attacker-chosen SIP text, so the page never
+    /// writes data as HTML, and loads nothing from anywhere else.
+    #[test]
+    fn the_dashboard_never_writes_data_as_html_or_loads_from_elsewhere() {
+        for banned in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+            "eval(",
+        ] {
+            assert!(!DASHBOARD_JS.contains(banned), "{banned}");
+        }
+        for file in [DASHBOARD_HTML, DASHBOARD_CSS, DASHBOARD_JS] {
+            assert!(!file.contains("://"), "every reference is same-origin");
+        }
+        assert!(
+            !DASHBOARD_HTML.contains("<script>") && !DASHBOARD_HTML.contains("style="),
+            "no inline script or style, which the policy would block"
+        );
+        assert!(
+            !DASHBOARD_JS.contains("/v1/unban"),
+            "read-only: the page never asks to lift a block"
+        );
+    }
+
+    /// The page and its files hold no data, so they load without the token
+    /// (the page then asks for it); the Host check still applies to them.
+    #[test]
+    fn the_dashboard_files_need_no_token_but_still_a_known_host() {
+        let o = Options {
+            token: Some("s3cret".into()),
+            ..off()
+        };
+        for path in DASHBOARD_FILES {
+            assert_eq!(route(&get(path), &up(), &o).status, 200, "{path}");
+            let mut r = get(path);
+            r.headers = vec![("host".into(), "rebound.example".into())];
+            assert_eq!(route(&r, &up(), &o).status, 403, "{path}");
+        }
+        assert_eq!(
+            route(&get("/v1/status"), &up(), &o).status,
+            401,
+            "the data itself still needs the token"
+        );
+    }
+
     #[test]
     fn a_token_guards_every_route_but_health() {
         let o = Options {
@@ -1739,7 +1868,7 @@ mod tests {
     #[test]
     fn unknown_paths_are_404_and_wrong_methods_405() {
         assert_eq!(route(&get("/v2/blocks"), &up(), &on()).status, 404);
-        assert_eq!(route(&get("/"), &up(), &on()).status, 404);
+        assert_eq!(route(&get("/index.html"), &up(), &on()).status, 404);
         let mut r = get("/v1/blocks");
         r.method = "DELETE".into();
         let resp = route(&r, &up(), &on());
