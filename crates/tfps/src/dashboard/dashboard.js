@@ -284,7 +284,9 @@ async function refresh() {
   showError("log-error", log.status === "rejected" ? log.reason : null);
   if (blocks) {
     if (blocks.status === "fulfilled") {
-      lastBlocks = blocks.value;
+      // The API lists blocks in kernel-map order; the table shows the newest
+      // first, so the row limit keeps the newest. No first-seen sorts last.
+      lastBlocks = blocks.value.slice().sort((a, b) => (b.first_seen || 0) - (a.first_seen || 0));
       renderBlocks();
     }
     showError("blocks-error", blocks.status === "rejected" ? blocks.reason : null);

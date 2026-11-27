@@ -22,6 +22,9 @@ use tfps::store::BlockRow;
 
 const LISTEN: &str = "127.0.0.1:19060";
 
+/// Blocks in the demo map: most of the 762 documentation addresses.
+const BLOCKED: usize = 700;
+
 /// The reasons the perimeter gives, with a detail each and how often they occur.
 const REASONS: [(&str, &[&str], u32); 6] = [
     (
@@ -87,10 +90,18 @@ impl Demo {
             Ipv4Addr::new(n[0], n[1], n[2], 1 + rng.below(254) as u8).to_string()
         };
 
+        // Every address in the three documentation ranges once, shuffled: a
+        // block map holds each address at most once, and so must the demo.
+        let mut pool: Vec<String> = [[198, 51, 100], [203, 0, 113], [192, 0, 2]]
+            .iter()
+            .flat_map(|n| (1..=254u8).map(move |h| Ipv4Addr::new(n[0], n[1], n[2], h).to_string()))
+            .collect();
+        for i in (1..pool.len()).rev() {
+            pool.swap(i, rng.below(i as u64 + 1) as usize);
+        }
         let mut blocks = Vec::new();
-        for i in 0..1_284u32 {
+        for (i, addr) in pool.into_iter().take(BLOCKED).enumerate() {
             let first = now - rng.below(3_500) as u32;
-            let addr = ip(&mut rng);
             let doc = match i % 10 {
                 // Feed entries: no reason of ours, no expiry for a week.
                 0 | 1 => banned_doc(
@@ -118,7 +129,6 @@ impl Demo {
             };
             blocks.push(doc);
         }
-        blocks.sort_by_key(|b| std::cmp::Reverse(b.first_seen));
 
         let mut log = Vec::new();
         let mut ts = now - 20;
