@@ -72,9 +72,9 @@ pub struct Event {
 pub struct Cursor {
     /// The last `block_log` row number read.
     pub block_log: i64,
-    /// That row's time. If row numbers start again from 1 (the table emptied by
-    /// pruning), rows older than this are taken as already sent.
-    pub block_log_ts: u32,
+    /// That row's whole content (`store::block_log_key`), so a row number
+    /// reused after the table was emptied is recognised as a different row.
+    pub block_log_key: String,
     /// Where reading the manual-action record stopped.
     pub manual: Position,
 }
@@ -463,11 +463,11 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
         Some(c) => c,
         None => loop {
             // No cursor yet: start at the current end, so history is not replayed.
-            match Store::open_readonly(&ctx.db).and_then(|s| s.block_log_end()) {
-                Ok((row, ts)) => {
+            match Store::open_readonly(&ctx.db).and_then(|s| s.block_log_tail()) {
+                Ok((row, key)) => {
                     let c = Cursor {
                         block_log: row,
-                        block_log_ts: ts,
+                        block_log_key: key,
                         manual: crate::manual_log::end_position(&manual_dir),
                     };
                     save_or_say(&cursor_file, &c);
@@ -525,24 +525,19 @@ fn poll_once(
 ) -> Result<bool, String> {
     let store = Store::open_readonly(&ctx.db)?;
     // Row numbers that started again (the table emptied by pruning, then
-    // refilled) are taken up from the start, skipping rows no newer than the
-    // last one sent.
-    let cutoff = if cursor.block_log > 0
-        && store.block_log_restarted(cursor.block_log, cursor.block_log_ts)?
-    {
+    // refilled) are read from the first row: every row of a refilled table
+    // is new.
+    let batch = store.block_log_batch(cursor.block_log, &cursor.block_log_key, ROWS_PER_POLL)?;
+    let more = batch.rows.len() == ROWS_PER_POLL;
+    let last = batch
+        .rows
+        .last()
+        .map(|(row, r)| (*row, crate::store::block_log_key(r)));
+    if batch.restarted && last.is_none() {
         cursor.block_log = 0;
-        Some(cursor.block_log_ts)
-    } else {
-        None
-    };
-    let raw = store.block_log_after(cursor.block_log, ROWS_PER_POLL)?;
-    let more = raw.len() == ROWS_PER_POLL;
-    let last = raw.last().map(|(row, r)| (*row, r.ts));
-    let blocks: Vec<BlockRow> = raw
-        .into_iter()
-        .map(|(_, r)| r)
-        .filter(|r| cutoff.is_none_or(|c| r.ts > c))
-        .collect();
+        cursor.block_log_key.clear();
+    }
+    let blocks: Vec<BlockRow> = batch.rows.into_iter().map(|(_, r)| r).collect();
     let (manual, manual_pos, unreadable) =
         crate::manual_log::read_after(manual_dir, &cursor.manual);
     if unreadable > 0 {
@@ -574,23 +569,32 @@ fn poll_once(
     for e in &events {
         sender.send(e);
     }
-    if let Some((row, ts)) = last {
+    if let Some((row, key)) = last {
         cursor.block_log = row;
-        cursor.block_log_ts = ts;
+        cursor.block_log_key = key;
     }
     cursor.manual = manual_pos;
     Ok(more)
 }
 
-/// Of the addresses in the map, those the audit log or a manual ban explain:
-/// what a baseline watches, so APIBAN-only blocks never produce events.
+/// Of the addresses in the map, those this host's own blocking explains: what a
+/// baseline watches, so APIBAN feed blocks never produce events.
+///
+/// An address the audit log mentions is ours unless its map entry is
+/// permanent and the address is on the APIBAN feed: the perimeter blocked it
+/// once, but what holds it now is the feed's permanent block. An address whose
+/// latest manual action is a ban is ours either way.
 fn known_among(store: &Store, manual_dir: &Path, entries: &[(Ipv4Addr, u64)]) -> HashSet<Ipv4Addr> {
     let among = crate::ctl::map_addresses(entries);
-    let mut known: HashSet<Ipv4Addr> = store
-        .logged_among(&among)
-        .unwrap_or_default()
+    let logged = store.logged_among(&among).unwrap_or_default();
+    let feed = store.apiban_among(&among).unwrap_or_default();
+    let mut known: HashSet<Ipv4Addr> = entries
         .iter()
-        .filter_map(|s| s.parse().ok())
+        .filter(|(ip, until)| {
+            let s = ip.to_string();
+            logged.contains(&s) && !(*until == 0 && feed.contains(&s))
+        })
+        .map(|(ip, _)| *ip)
         .collect();
     let wanted: HashSet<Ipv4Addr> = entries.iter().map(|(ip, _)| *ip).collect();
     let manual = crate::manual_log::latest_for(manual_dir, &wanted);
@@ -854,6 +858,36 @@ mod tests {
         }
     }
 
+    /// A permanent block on the APIBAN feed is the feed's, even when the
+    /// perimeter once blocked the same address; a perimeter block with an
+    /// expiry, and a manual ban, are ours.
+    #[test]
+    fn the_baseline_watches_only_this_hosts_own_blocks() {
+        let p = std::env::temp_dir().join(format!("tfps-hooks-known-{}.db", std::process::id()));
+        let dir = p.with_extension("manual");
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut s = Store::open(&p).unwrap();
+        for last in [1, 2] {
+            s.log_block(100, ip(last), "scanner", "x").unwrap();
+        }
+        s.apiban_add(&[ip(2), ip(3)], 100).unwrap();
+        crate::manual_log::append(&dir, &[manual(ManualVerb::Ban, 4, 1_795_000_000)], 0o600)
+            .unwrap();
+        let entries = [
+            (ip(1), 50 * SEC), // perimeter block with an expiry: ours
+            (ip(2), 0),        // once a perimeter block, now the feed's permanent one
+            (ip(3), 0),        // the feed only
+            (ip(4), 0),        // a manual ban
+        ];
+        let mut got: Vec<_> = known_among(&s, &dir, &entries).into_iter().collect();
+        got.sort();
+        assert_eq!(got, [ip(1), ip(4)]);
+        drop(s);
+        let _ = std::fs::remove_file(&p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_cursor_survives_a_restart() {
         let path = std::env::temp_dir().join(format!("tfps-hooks-cursor-{}", std::process::id()));
@@ -861,7 +895,7 @@ mod tests {
         assert_eq!(load_cursor(&path), None);
         let c = Cursor {
             block_log: 42,
-            block_log_ts: 1_795_000_000,
+            block_log_key: "1795000000\t203.0.113.1\tscanner\tx".into(),
             manual: Position {
                 file: "manual_actions-202611.jsonl".into(),
                 offset: 120,

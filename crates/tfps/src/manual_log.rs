@@ -207,16 +207,18 @@ pub fn read_after(dir: &Path, from: &Position) -> (Vec<ManualAction>, Position, 
             continue; // an earlier month, already read
         }
         let start = if name == pos.file { pos.offset } else { 0 };
+        // A file that cannot be read stops the read here, so the position never
+        // moves past it: it is tried again next time instead of being skipped.
         let Ok(mut f) = std::fs::File::open(&path) else {
             unreadable += 1;
-            continue;
+            break;
         };
         let len = f.metadata().map(|m| m.len()).unwrap_or(0);
         let start = if len < start { 0 } else { start };
         let mut bytes = Vec::new();
         if f.seek(SeekFrom::Start(start)).is_err() || f.read_to_end(&mut bytes).is_err() {
             unreadable += 1;
-            continue;
+            break;
         }
         let whole = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
         for line in String::from_utf8_lossy(&bytes[..whole])
@@ -608,6 +610,20 @@ mod tests {
         let (next, pos5, _) = read_after(&dir, &pos4);
         assert_eq!(next.len(), 1);
         assert_ne!(pos5.file, pos4.file, "moved on to December");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A month file that cannot be read stops the read where it is, so a later
+    /// month never carries the position past it.
+    #[test]
+    fn an_unreadable_month_is_retried_not_skipped() {
+        let dir = std::env::temp_dir().join(format!("tfps-manual-stuck-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("manual_actions-202611.jsonl")).unwrap(); // unreadable
+        append(&dir, &[action(1_797_000_000, ManualVerb::Ban, 3)], 0o600).unwrap(); // December
+        let (got, pos, bad) = read_after(&dir, &Position::default());
+        assert!(got.is_empty() && bad == 1, "{got:?} {bad}");
+        assert_eq!(pos, Position::default(), "not moved past November");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

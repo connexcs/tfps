@@ -53,7 +53,8 @@ ProtectControlGroups=yes
 ProtectClock=yes
 PrivateDevices=yes
 RestrictNamespaces=yes
-RestrictAddressFamilies=AF_INET AF_UNIX
+# AF_INET6 for webhook receivers reached over IPv6.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

@@ -69,6 +69,20 @@ pub struct BlockRow {
     pub detail: String,
 }
 
+/// One batch of `block_log` rows (see `Store::block_log_batch`).
+pub struct LogBatch {
+    /// The table's row numbers started again; `rows` begin from its first row.
+    pub restarted: bool,
+    /// Row number and row, oldest first.
+    pub rows: Vec<(i64, BlockRow)>,
+}
+
+/// A `block_log` row's whole content as one string, so a cursor can tell the
+/// row it saved from a different row that later got the same number.
+pub fn block_log_key(r: &BlockRow) -> String {
+    format!("{}\t{}\t{}\t{}", r.ts, r.ip, r.reason, r.detail)
+}
+
 /// What the audit log says about one address: the reason and detail of its
 /// newest row, and the times of its newest and oldest rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -692,25 +706,81 @@ impl Store {
             .collect()
     }
 
-    /// Whether `block_log`'s row numbers have started again since row `row` was
-    /// read with time `ts`: the table was emptied (pruning) and refilled, so
-    /// row numbers no longer mean what the cursor saved. True when that row now
-    /// holds a different time, or is gone with the newest row below it.
-    pub fn block_log_restarted(&self, row: i64, ts: u32) -> Result<bool, String> {
-        let at: Option<u32> = self
+    /// The next batch of `block_log` rows after row `after`, whose content was
+    /// `after_key` (see [`block_log_key`]) when it was read, all from one
+    /// snapshot of the table.
+    ///
+    /// If that row now holds something else, or is gone with the newest row
+    /// below it, the table was emptied (pruning) and its row numbers started
+    /// again: the batch then starts from the first row and says so. Comparing
+    /// the whole row, not only its time, catches a reused row number written in
+    /// the same second. A row pruned from under a table that still has newer
+    /// rows is not a restart: SQLite does not reuse a number below the newest.
+    pub fn block_log_batch(
+        &self,
+        after: i64,
+        after_key: &str,
+        limit: usize,
+    ) -> Result<LogBatch, String> {
+        // One read transaction, so the check and the read see the same table
+        // even if the daemon prunes and writes in between.
+        let tx = self
             .conn
-            .query_row("SELECT ts FROM block_log WHERE rowid = ?1", [row], |r| {
-                r.get(0)
-            })
-            .map(Some)
+            .unchecked_transaction()
+            .map_err(|e| format!("reading block_log: {e}"))?;
+        let restarted = after > 0 && {
+            let at = self
+                .conn
+                .query_row(
+                    "SELECT ts, ip, reason, detail FROM block_log WHERE rowid = ?1",
+                    [after],
+                    |r| {
+                        Ok(BlockRow {
+                            ts: r.get(0)?,
+                            ip: r.get(1)?,
+                            reason: r.get(2)?,
+                            detail: r.get(3)?,
+                        })
+                    },
+                )
+                .map(Some)
+                .or_else(|e| match e {
+                    rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                    e => Err(format!("reading block_log: {e}")),
+                })?;
+            match at {
+                Some(row) => block_log_key(&row) != after_key,
+                None => self.block_log_end()?.0 < after,
+            }
+        };
+        let rows = self.block_log_after(if restarted { 0 } else { after }, limit)?;
+        drop(tx);
+        Ok(LogBatch { restarted, rows })
+    }
+
+    /// The newest `block_log` row number and its [`block_log_key`], or
+    /// `(0, "")` when the table is empty: where a new reader starts.
+    pub fn block_log_tail(&self) -> Result<(i64, String), String> {
+        self.conn
+            .query_row(
+                "SELECT rowid, ts, ip, reason, detail FROM block_log ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        block_log_key(&BlockRow {
+                            ts: r.get(1)?,
+                            ip: r.get(2)?,
+                            reason: r.get(3)?,
+                            detail: r.get(4)?,
+                        }),
+                    ))
+                },
+            )
             .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                rusqlite::Error::QueryReturnedNoRows => Ok((0, String::new())),
                 e => Err(format!("reading block_log: {e}")),
-            })?;
-        Ok(match at {
-            Some(t) => t != ts,
-            None => self.block_log_end()?.0 < row,
-        })
+            })
     }
 
     /// The newest `block_log` row number and its time, or `(0, 0)` when empty.
@@ -1007,27 +1077,34 @@ mod tests {
             s.block_log_after(end, 100).unwrap().is_empty(),
             "nothing new"
         );
-        assert!(
-            !s.block_log_restarted(end, 300).unwrap(),
-            "same row, same time"
-        );
+        let saved = block_log_key(&s.block_log_after(end - 1, 1).unwrap().remove(0).1);
+        let b = s.block_log_batch(end, &saved, 100).unwrap();
+        assert!(!b.restarted && b.rows.is_empty(), "same row, nothing new");
+        assert_eq!(s.block_log_tail().unwrap(), (end, saved.clone()));
 
-        // Emptied and refilled past the saved row: row numbers started again,
-        // and the saved row now holds a newer block.
+        // Older rows pruned from under newer ones: not a restart.
+        s.conn
+            .execute("DELETE FROM block_log WHERE rowid < ?1", [end])
+            .unwrap();
+        assert!(!s.block_log_batch(end, &saved, 100).unwrap().restarted);
+
+        // Emptied, then refilled with rows in the same second as the saved
+        // one: the saved row number is reused for a different row.
         s.conn.execute("DELETE FROM block_log", []).unwrap();
         for i in 0..5u8 {
             s.log_block(
-                400 + u32::from(i),
+                300,
                 std::net::Ipv4Addr::new(198, 51, 100, i),
                 "scanner",
-                "x",
+                "y",
             )
             .unwrap();
         }
-        assert!(
-            s.block_log_restarted(end, 300).unwrap(),
-            "refilled beyond the saved row"
-        );
+        let b = s.block_log_batch(end, &saved, 100).unwrap();
+        assert!(b.restarted, "a reused row number with the same time");
+        assert_eq!(b.rows.len(), 5, "every new row, from the first");
+
+        // Emptied and refilled below the saved row.
         s.conn.execute("DELETE FROM block_log", []).unwrap();
         s.log_block(
             500,
@@ -1036,10 +1113,10 @@ mod tests {
             "x",
         )
         .unwrap();
-        assert!(
-            s.block_log_restarted(end, 300).unwrap(),
-            "refilled below the saved row"
-        );
+        let b = s.block_log_batch(end, &saved, 100).unwrap();
+        assert!(b.restarted && b.rows.len() == 1);
+        s.conn.execute("DELETE FROM block_log", []).unwrap();
+        assert_eq!(s.block_log_tail().unwrap(), (0, String::new()));
         drop(s);
         let _ = std::fs::remove_file(&p);
     }
