@@ -35,6 +35,16 @@ const FAMILY_V6: u8 = 10;
 pub const IPPROTO_TCP: u8 = 6;
 pub const IPPROTO_UDP: u8 = 17;
 
+/// What OpenSIPS's `tracer` puts in chunk 2 for a message over TLS: it has no
+/// IP protocol of its own, so `pipport2su()` borrows `IPPROTO_IDP` (22) as a
+/// "fake proto type" (`modules/tracer/tracer.c`).
+pub const OPENSIPS_TLS: u8 = 22;
+
+/// What OpenSIPS's `tracer` puts in chunk 2 for WebSocket, plain or secure:
+/// `IPPROTO_ESP` (50), the same way. Its test is a `"ws"` prefix, so `wss`
+/// matches it too.
+pub const OPENSIPS_WS: u8 = 50;
+
 /// Payload protocol value in chunk 11 for SIP.
 pub const PROTO_SIP: u8 = 1;
 
@@ -164,6 +174,7 @@ fn be32(b: &[u8]) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Transport {
     /// TCP, and everything carried over it: TLS, WebSocket, secure WebSocket.
+    /// Chunk 2 says 6, or OpenSIPS's [`OPENSIPS_TLS`] or [`OPENSIPS_WS`].
     Tcp,
     /// UDP, which TFPS already sees on the wire.
     Udp,
@@ -249,7 +260,8 @@ pub fn classify<'a>(hep: &Hep<'a>, f: &Filter<'_>) -> Result<Message<'a>, Skip> 
         return Err(Skip::Incomplete);
     };
     let transport = match hep.ip_proto {
-        Some(IPPROTO_TCP) => Transport::Tcp,
+        // TLS and WebSocket run over TCP, whatever number the sender chose to say so.
+        Some(IPPROTO_TCP | OPENSIPS_TLS | OPENSIPS_WS) => Transport::Tcp,
         Some(IPPROTO_UDP) => Transport::Udp,
         Some(_) => return Err(Skip::Proto),
         None => return Err(Skip::Incomplete),
@@ -512,6 +524,32 @@ mod tests {
         );
     }
 
+    /// OpenSIPS marks TLS as 22 and WS / WSS as 50 in chunk 2. Both are TCP:
+    /// judged when TCP is accepted, not spoofable, and skipped as TCP otherwise.
+    #[test]
+    fn opensips_tls_and_websocket_numbers_are_tcp() {
+        for ip_proto in [IPPROTO_TCP, OPENSIPS_TLS, OPENSIPS_WS] {
+            let bytes = sip(&Sip {
+                src: (CLIENT, 51_234),
+                dst: (SERVER, 443),
+                ip_proto,
+                ts: NOW,
+                auth_key: None,
+                payload: b"OPTIONS sip:x SIP/2.0\r\n\r\n",
+            });
+            let h = parse(&bytes).unwrap();
+            let m = classify(&h, &filter()).expect("accepted as TCP");
+            assert_eq!(m.transport, Transport::Tcp, "{ip_proto}");
+            assert!(!m.transport.spoofable());
+            let udp_only = Filter {
+                tcp: false,
+                udp: true,
+                ..filter()
+            };
+            assert_eq!(classify(&h, &udp_only), Err(Skip::Tcp), "{ip_proto}");
+        }
+    }
+
     #[test]
     fn a_compressed_payload_is_skipped() {
         let p = packet(&[
@@ -672,7 +710,8 @@ mod tests {
 
     /// Synthetic fixtures, built to the HEP3 layout OpenSIPS `proto_hep` sends with
     /// the plain (Homer 5) payload: a WSS REGISTER answered 401 then 200, a WSS
-    /// INVITE and a TLS INVITE. Not captured from a live OpenSIPS.
+    /// INVITE and a TLS INVITE, with chunk 2 as OpenSIPS's `tracer` sets it for
+    /// each transport. Not captured from a live OpenSIPS.
     mod fixtures {
         use super::*;
         use crate::dialplan::DialPlan;
@@ -681,22 +720,22 @@ mod tests {
 
         const CLIENT_PORT: u16 = 51_234;
 
-        fn from_client(server_port: u16, payload: &[u8]) -> Vec<u8> {
+        fn from_client(ip_proto: u8, server_port: u16, payload: &[u8]) -> Vec<u8> {
             sip(&Sip {
                 src: (CLIENT, CLIENT_PORT),
                 dst: (SERVER, server_port),
-                ip_proto: IPPROTO_TCP,
+                ip_proto,
                 ts: NOW,
                 auth_key: None,
                 payload,
             })
         }
 
-        fn to_client(server_port: u16, payload: &[u8]) -> Vec<u8> {
+        fn to_client(ip_proto: u8, server_port: u16, payload: &[u8]) -> Vec<u8> {
             sip(&Sip {
                 src: (SERVER, server_port),
                 dst: (CLIENT, CLIENT_PORT),
-                ip_proto: IPPROTO_TCP,
+                ip_proto,
                 ts: NOW,
                 auth_key: None,
                 payload,
@@ -776,12 +815,22 @@ Content-Length: 0\r\n\r\n";
             let mut e = Engine::new(DialPlan::new(["00"]), Mode::Active);
             let t = Timestamp(NOW);
             let exchange = [
-                (from_client(443, WSS_REGISTER), (CLIENT, SERVER)),
-                (to_client(443, WSS_401), (SERVER, CLIENT)),
-                (from_client(443, WSS_REGISTER_AUTH), (CLIENT, SERVER)),
-                (to_client(443, WSS_200), (SERVER, CLIENT)),
-                (from_client(443, WSS_INVITE), (CLIENT, SERVER)),
-                (from_client(5061, TLS_INVITE), (CLIENT, SERVER)),
+                // Chunk 2 as OpenSIPS's tracer sets it: 50 for WSS, 22 for TLS.
+                (
+                    from_client(OPENSIPS_WS, 443, WSS_REGISTER),
+                    (CLIENT, SERVER),
+                ),
+                (to_client(OPENSIPS_WS, 443, WSS_401), (SERVER, CLIENT)),
+                (
+                    from_client(OPENSIPS_WS, 443, WSS_REGISTER_AUTH),
+                    (CLIENT, SERVER),
+                ),
+                (to_client(OPENSIPS_WS, 443, WSS_200), (SERVER, CLIENT)),
+                (from_client(OPENSIPS_WS, 443, WSS_INVITE), (CLIENT, SERVER)),
+                (
+                    from_client(OPENSIPS_TLS, 5061, TLS_INVITE),
+                    (CLIENT, SERVER),
+                ),
             ];
             for (bytes, (src, dst)) in &exchange {
                 let m = accept(bytes);

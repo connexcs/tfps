@@ -163,16 +163,119 @@ fn received(status: u16, body: &str) -> Result<Batch, String> {
 
 /// An HTTP agent whose DNS does not go through the C library (see `fetch`), with
 /// `timeout` over each whole call, and statuses returned rather than raised.
-/// Shared with the webhook sender, which has the same static-musl constraints.
 pub(crate) fn agent(timeout: Duration) -> ureq::Agent {
+    with_resolver(timeout, MuslSafeResolver)
+}
+
+/// The webhook sender's agent: the same, but its resolver also reads
+/// `/etc/hosts` and falls back to IPv6 ([`HookResolver`]). A webhook URL names
+/// whatever host the operator chose, often a local or internal one, where the
+/// APIBAN resolver, built for one public IPv4 host, would not find it.
+pub(crate) fn hook_agent(timeout: Duration) -> ureq::Agent {
+    with_resolver(timeout, HookResolver)
+}
+
+fn with_resolver(
+    timeout: Duration,
+    resolver: impl ureq::unversioned::resolver::Resolver + 'static,
+) -> ureq::Agent {
     ureq::Agent::with_parts(
         ureq::config::Config::builder()
             .timeout_global(Some(timeout))
             .http_status_as_error(false)
             .build(),
         ureq::unversioned::transport::DefaultConnector::default(),
-        MuslSafeResolver,
+        resolver,
     )
+}
+
+/// The host and port a URL connects to; the port defaults by scheme.
+fn host_port(uri: &ureq::http::Uri) -> Result<(&str, u16), ureq::Error> {
+    let authority = uri.authority().ok_or(ureq::Error::HostNotFound)?;
+    let port = authority.port_u16().unwrap_or_else(|| {
+        if uri.scheme_str() == Some("http") {
+            80
+        } else {
+            443
+        }
+    });
+    Ok((authority.host(), port))
+}
+
+/// The webhook resolver, still without the C library's `getaddrinfo`:
+///
+/// 1. an address literal (IPv4, or IPv6 in brackets) is used as it is;
+/// 2. a name in `/etc/hosts` resolves to every address it has there, IPv4 first,
+///    and DNS is not asked (as `files` before `dns` in `nsswitch.conf`);
+/// 3. otherwise DNS: the A records, or the AAAA records when there are none.
+///
+/// IPv4 comes first because the HTTP client gives up at the first address that
+/// fails with anything but a refusal, and a host with an IPv6 address but no
+/// IPv6 route fails that way.
+#[derive(Debug)]
+struct HookResolver;
+
+impl ureq::unversioned::resolver::Resolver for HookResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
+        let (host, port) = host_port(uri)?;
+        let hosts = std::fs::read_to_string("/etc/hosts").unwrap_or_default();
+        let ips = hook_addresses(host, &hosts, |name| {
+            let v4 = dns::resolve(name, dns::A, Duration::from_secs(5));
+            if v4.is_empty() {
+                dns::resolve(name, dns::AAAA, Duration::from_secs(5))
+            } else {
+                v4
+            }
+        });
+        if ips.is_empty() {
+            return Err(ureq::Error::HostNotFound);
+        }
+        let mut out = self.empty();
+        // The client holds at most 16 addresses.
+        for ip in ips.into_iter().take(16) {
+            out.push(std::net::SocketAddr::new(ip, port));
+        }
+        Ok(out)
+    }
+}
+
+/// The addresses for `host`, as [`HookResolver`] finds them, with `hosts` the
+/// text of `/etc/hosts` and `dns` the DNS lookup. Pure, so every rule is testable.
+fn hook_addresses(
+    host: &str,
+    hosts: &str,
+    dns: impl FnOnce(&str) -> Vec<std::net::IpAddr>,
+) -> Vec<std::net::IpAddr> {
+    use std::net::IpAddr;
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = literal.parse::<IpAddr>() {
+        return vec![ip];
+    }
+    let name = host.trim_end_matches('.');
+    let mut local: Vec<IpAddr> = Vec::new();
+    for line in hosts.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let mut fields = line.split_whitespace();
+        let Some(Ok(ip)) = fields.next().map(str::parse::<IpAddr>) else {
+            continue;
+        };
+        if fields.any(|n| n.trim_end_matches('.').eq_ignore_ascii_case(name))
+            && !local.contains(&ip)
+        {
+            local.push(ip);
+        }
+    }
+    if local.is_empty() {
+        local = dns(name);
+    }
+    // IPv4 first, each family in the order found.
+    local.sort_by_key(|ip| ip.is_ipv6());
+    local
 }
 
 /// A resolver that does its own DNS, independent of the C library's `getaddrinfo`.
@@ -187,15 +290,7 @@ impl ureq::unversioned::resolver::Resolver for MuslSafeResolver {
         timeout: ureq::unversioned::transport::NextTimeout,
     ) -> Result<ureq::unversioned::resolver::ResolvedSocketAddrs, ureq::Error> {
         use std::net::{IpAddr, SocketAddr};
-        let authority = uri.authority().ok_or(ureq::Error::HostNotFound)?;
-        let host = authority.host();
-        let port = authority.port_u16().unwrap_or_else(|| {
-            if uri.scheme_str() == Some("http") {
-                80
-            } else {
-                443
-            }
-        });
+        let (host, port) = host_port(uri)?;
 
         let mut out = self.empty();
         // If it is already an IP, use it as-is.
@@ -251,18 +346,35 @@ mod dns {
         out
     }
 
+    /// Record types this client asks for.
+    pub const A: u16 = 1;
+    pub const AAAA: u16 = 28;
+
     /// Looks up the first IPv4 for `host`, trying each nameserver until one answers.
     pub fn resolve_a(host: &str, timeout: Duration) -> Option<Ipv4Addr> {
+        resolve(host, A, timeout)
+            .into_iter()
+            .find_map(|ip| match ip {
+                IpAddr::V4(v4) => Some(v4),
+                IpAddr::V6(_) => None,
+            })
+    }
+
+    /// Every address of record type `qtype` (`A` or `AAAA`) for `host`, from the
+    /// first nameserver that answers with any.
+    pub fn resolve(host: &str, qtype: u16, timeout: Duration) -> Vec<IpAddr> {
         let mut q: Vec<u8> = Vec::with_capacity(64);
         q.extend_from_slice(&[0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
         for label in host.split('.').filter(|l| !l.is_empty()) {
             if label.len() > 63 {
-                return None;
+                return Vec::new();
             }
             q.push(label.len() as u8);
             q.extend_from_slice(label.as_bytes());
         }
-        q.extend_from_slice(&[0x00, 0x00, 0x01, 0x00, 0x01]); // end, type A, class IN
+        q.push(0); // end of name
+        q.extend_from_slice(&qtype.to_be_bytes());
+        q.extend_from_slice(&[0x00, 0x01]); // class IN
 
         for ns in nameservers() {
             let Ok(sock) = UdpSocket::bind("0.0.0.0:0") else {
@@ -276,38 +388,68 @@ mod dns {
             let Ok(n) = sock.recv(&mut buf) else {
                 continue;
             };
-            if let Some(ip) = first_a(&buf[..n]) {
-                return Some(ip);
+            let found = records(&buf[..n], qtype);
+            if !found.is_empty() {
+                return found;
             }
         }
-        None
+        Vec::new()
     }
 
+    #[cfg(test)]
     fn first_a(msg: &[u8]) -> Option<Ipv4Addr> {
+        records(msg, A).into_iter().find_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+    }
+
+    /// The answer records of type `qtype` in a DNS response. A truncated or
+    /// malformed message yields what was read before the damage, never a panic.
+    fn records(msg: &[u8], qtype: u16) -> Vec<IpAddr> {
+        let mut out = Vec::new();
         if msg.len() < 12 {
-            return None;
+            return out;
         }
         let qd = u16::from_be_bytes([msg[4], msg[5]]) as usize;
         let an = u16::from_be_bytes([msg[6], msg[7]]) as usize;
         let mut i = 12;
         for _ in 0..qd {
-            i = skip_name(msg, i)?;
-            i += 4;
+            let Some(next) = skip_name(msg, i) else {
+                return out;
+            };
+            i = next + 4;
         }
         for _ in 0..an {
-            i = skip_name(msg, i)?;
+            let Some(next) = skip_name(msg, i) else {
+                return out;
+            };
+            i = next;
             if i + 10 > msg.len() {
-                return None;
+                return out;
             }
             let rtype = u16::from_be_bytes([msg[i], msg[i + 1]]);
             let rdlen = u16::from_be_bytes([msg[i + 8], msg[i + 9]]) as usize;
             i += 10;
-            if rtype == 1 && rdlen == 4 && i + 4 <= msg.len() {
-                return Some(Ipv4Addr::new(msg[i], msg[i + 1], msg[i + 2], msg[i + 3]));
+            let Some(data) = msg.get(i..i + rdlen) else {
+                return out;
+            };
+            match (rtype, data.len()) {
+                (A, 4) if qtype == A => {
+                    out.push(IpAddr::V4(Ipv4Addr::new(
+                        data[0], data[1], data[2], data[3],
+                    )));
+                }
+                (AAAA, 16) if qtype == AAAA => {
+                    let mut b = [0u8; 16];
+                    b.copy_from_slice(data);
+                    out.push(IpAddr::V6(std::net::Ipv6Addr::from(b)));
+                }
+                _ => {}
             }
             i += rdlen;
         }
-        None
+        out
     }
 
     /// Steps past a DNS name (labels or a compression pointer).
@@ -343,7 +485,34 @@ mod dns {
         fn a_truncated_message_does_not_panic() {
             for cut in 0..40 {
                 let _ = first_a(&[0u8; 40][..cut]);
+                let _ = records(&[0u8; 40][..cut], AAAA);
             }
+        }
+
+        #[test]
+        fn parses_every_aaaa_record_and_only_the_type_asked_for() {
+            // 1 question, 3 answers: AAAA 2001:db8::1, A 1.2.3.4, AAAA 2001:db8::2.
+            let mut msg = vec![
+                0x12, 0x34, 0x81, 0x80, 0, 1, 0, 3, 0, 0, 0, 0, // header
+                1, b'x', 0, 0, 28, 0, 1, // question x. AAAA IN
+            ];
+            let aaaa = |last: u8| {
+                let mut r = vec![0xc0, 0x0c, 0, 28, 0, 1, 0, 0, 0, 60, 0, 16];
+                r.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                r.push(last);
+                r
+            };
+            msg.extend(aaaa(1));
+            msg.extend([0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+            msg.extend(aaaa(2));
+            assert_eq!(
+                records(&msg, AAAA),
+                [
+                    "2001:db8::1".parse::<IpAddr>().unwrap(),
+                    "2001:db8::2".parse().unwrap()
+                ]
+            );
+            assert_eq!(records(&msg, A), [IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))]);
         }
 
         #[test]
@@ -397,6 +566,49 @@ fn between(s: &str, open: char, close: char) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hook_host_resolves_from_etc_hosts_before_dns() {
+        use std::net::IpAddr;
+        let hosts = "# comment\n\
+                     127.0.0.1   localhost\n\
+                     ::1         localhost ip6-localhost\n\
+                     10.0.0.7    panel.internal panel   # the control panel\n\
+                     fd00::7     v6only.internal\n";
+        let no_dns = |_: &str| -> Vec<IpAddr> { panic!("DNS is not asked") };
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert_eq!(
+            hook_addresses("localhost", hosts, no_dns),
+            [ip("127.0.0.1"), ip("::1")],
+            "every local address, IPv4 first"
+        );
+        assert_eq!(hook_addresses("PANEL", hosts, no_dns), [ip("10.0.0.7")]);
+        assert_eq!(
+            hook_addresses("panel.internal.", hosts, no_dns),
+            [ip("10.0.0.7")]
+        );
+        assert_eq!(
+            hook_addresses("v6only.internal", hosts, no_dns),
+            [ip("fd00::7")]
+        );
+        assert_eq!(
+            hook_addresses("192.0.2.1", hosts, no_dns),
+            [ip("192.0.2.1")]
+        );
+        assert_eq!(
+            hook_addresses("[2001:db8::5]", hosts, no_dns),
+            [ip("2001:db8::5")]
+        );
+        // Not in the file: DNS, IPv4 first whatever order it gives.
+        assert_eq!(
+            hook_addresses("hooks.example.com", hosts, |n| {
+                assert_eq!(n, "hooks.example.com");
+                vec![ip("2001:db8::9"), ip("198.51.100.9")]
+            }),
+            [ip("198.51.100.9"), ip("2001:db8::9")]
+        );
+        assert!(hook_addresses("nowhere.example", hosts, |_| Vec::new()).is_empty());
+    }
 
     #[test]
     fn extracts_addresses_and_the_next_id() {

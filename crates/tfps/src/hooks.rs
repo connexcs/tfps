@@ -155,48 +155,77 @@ impl Watcher {
                 .and_then(|&u| crate::ctl::expires_epoch(u, seen.now_wall, seen.now_mono))
         };
 
+        // One timeline, oldest first: a daemon block and a manual action are told
+        // in the order they happened, not stream by stream. Otherwise an unban
+        // and a re-block inside one poll would be told as block then unblock, and
+        // the watcher would stop watching a block that is in force.
+        //
+        // Within one second the order is unknowable from the times, so the map
+        // decides: an address in the map now was blocked after its unban, and one
+        // not in it was unbanned after its block.
+        enum Step<'s> {
+            Logged(Ipv4Addr, &'s BlockRow),
+            Manual(&'s ManualAction),
+        }
+        let in_map_now = |ip: &Ipv4Addr| seen.map.is_some() && in_map.contains_key(ip);
+        let mut steps: Vec<(u32, u8, Step<'_>)> = Vec::new();
         for row in seen.blocks {
-            let Ok(ip) = row.ip.parse::<Ipv4Addr>() else {
-                continue;
-            };
-            out.push(self.event(
-                "block",
-                ip,
-                row.ts,
-                Some(row.reason.clone()),
-                Some(row.detail.clone()),
-                expires(ip),
-                "tfps",
-            ));
-            self.watch(ip);
+            if let Ok(ip) = row.ip.parse::<Ipv4Addr>() {
+                steps.push((row.ts, 1, Step::Logged(ip, row)));
+            }
         }
         for a in seen.manual {
-            match a.verb {
-                ManualVerb::Ban => {
+            let tie = match a.verb {
+                ManualVerb::Ban => 1,
+                ManualVerb::Unban if in_map_now(&a.ip) => 0,
+                ManualVerb::Unban => 2,
+            };
+            steps.push((a.ts, tie, Step::Manual(a)));
+        }
+        // Stable: equal steps keep each stream's own order.
+        steps.sort_by_key(|(ts, tie, _)| (*ts, *tie));
+
+        for (_, _, step) in steps {
+            match step {
+                Step::Logged(ip, row) => {
                     out.push(self.event(
                         "block",
-                        a.ip,
-                        a.ts,
-                        Some("manual".into()),
-                        a.reason.clone(),
-                        a.expires,
-                        &a.source,
+                        ip,
+                        row.ts,
+                        Some(row.reason.clone()),
+                        Some(row.detail.clone()),
+                        expires(ip),
+                        "tfps",
                     ));
-                    self.watch(a.ip);
+                    self.watch(ip);
                 }
-                ManualVerb::Unban => {
-                    out.push(self.event(
-                        "unblock",
-                        a.ip,
-                        a.ts,
-                        a.reason.clone(),
-                        None,
-                        None,
-                        &a.source,
-                    ));
-                    self.watched.remove(&a.ip);
-                    self.missing.remove(&a.ip);
-                }
+                Step::Manual(a) => match a.verb {
+                    ManualVerb::Ban => {
+                        out.push(self.event(
+                            "block",
+                            a.ip,
+                            a.ts,
+                            Some("manual".into()),
+                            a.reason.clone(),
+                            a.expires,
+                            &a.source,
+                        ));
+                        self.watch(a.ip);
+                    }
+                    ManualVerb::Unban => {
+                        out.push(self.event(
+                            "unblock",
+                            a.ip,
+                            a.ts,
+                            a.reason.clone(),
+                            None,
+                            None,
+                            &a.source,
+                        ));
+                        self.watched.remove(&a.ip);
+                        self.missing.remove(&a.ip);
+                    }
+                },
             }
         }
 
@@ -397,7 +426,7 @@ impl Sender {
 
 /// One URL's worker: POST each event, retrying with backoff, then give up on it.
 fn deliver(index: usize, url: &str, rx: &Receiver<Arc<Vec<u8>>>, retry: &Retry, stats: &Stats) {
-    let agent = crate::apiban::agent(retry.timeout);
+    let agent = crate::apiban::hook_agent(retry.timeout);
     for body in rx {
         let mut attempt = 0;
         loop {
@@ -743,6 +772,70 @@ mod tests {
             poll(&mut w, &[], &[], Some(&[]), &[], 15).is_empty(),
             "once only"
         );
+    }
+
+    /// An unban and a re-block that land in the same poll are told in the order
+    /// they happened, and the block in force stays watched to its expiry.
+    #[test]
+    fn an_unban_then_a_reblock_in_one_poll_end_blocked_and_watched() {
+        let t0 = 1_795_000_000;
+        for (unban_at, reblock_at) in [(t0, t0 + 1), (t0, t0)] {
+            let mut w = Watcher::new("h".into());
+            let before = [(ip(1), 0)];
+            baseline(&mut w, &before, &[ip(1)]);
+            // The operator unbans; the daemon blocks it again before the next poll.
+            let after = [(ip(1), 30 * SEC)];
+            assert_eq!(
+                poll(
+                    &mut w,
+                    &[row(1, reblock_at)],
+                    &[manual(ManualVerb::Unban, 1, unban_at)],
+                    Some(&after),
+                    &[],
+                    2
+                ),
+                [
+                    ("unblock", ip(1), "panel".into()),
+                    ("block", ip(1), "tfps".into())
+                ],
+                "unban at {unban_at}, re-block at {reblock_at}"
+            );
+            // Still watched: its expiry is reported.
+            assert_eq!(
+                poll(&mut w, &[], &[], Some(&after), &[], 31),
+                [("expired", ip(1), "tfps".into())]
+            );
+        }
+    }
+
+    /// The other way round: blocked, then unbanned, in one poll. The address is
+    /// gone from the map, so it ends unblocked and unwatched, even within a second.
+    #[test]
+    fn a_block_then_an_unban_in_one_poll_end_unblocked() {
+        let t0 = 1_795_000_000;
+        for (block_at, unban_at) in [(t0, t0 + 1), (t0, t0)] {
+            let mut w = Watcher::new("h".into());
+            baseline(&mut w, &[], &[]);
+            assert_eq!(
+                poll(
+                    &mut w,
+                    &[row(1, block_at)],
+                    &[manual(ManualVerb::Unban, 1, unban_at)],
+                    Some(&[]),
+                    &[],
+                    2
+                ),
+                [
+                    ("block", ip(1), "tfps".into()),
+                    ("unblock", ip(1), "panel".into())
+                ]
+            );
+            assert!(
+                poll(&mut w, &[], &[], Some(&[]), &[], 3).is_empty()
+                    && poll(&mut w, &[], &[], Some(&[]), &[], 4).is_empty(),
+                "nothing more: not reported again as an unknown removal"
+            );
+        }
     }
 
     /// The grace poll is what stops an unban whose record lands a moment after

@@ -725,7 +725,8 @@ Every URL receives every event:
 of a block. `host` is this machine's name.
 
 **Delivery.** Each URL has its own worker and a queue of 1,000 events, so a slow or dead
-endpoint delays no other. An event is POSTed with a 5-second timeout and retried after 1, 2 and
+endpoint delays no other. A URL's host is looked up in `/etc/hosts` first, then in DNS (A
+records, or AAAA when there are none); IPv4 addresses are tried before IPv6. An event is POSTed with a 5-second timeout and retried after 1, 2 and
 4 seconds; then it is dropped and counted. `/metrics` exports
 `tfps_hook_deliveries_total{url_index,result="delivered|failed|queue_full"}`. Where reading
 stopped is kept in `/var/lib/tfps/hooks.cursor`, saved only when every queued event has been
@@ -741,6 +742,8 @@ begins at the current end.
   spoofed-source flood, or another program editing a shared map — is reported as `unblock` with
   `"source":"unknown"`, one poll late (so an unban whose record is still being written is not
   misreported), never silently dropped.
+- **Events are told in the order they happened** within a poll: an unban followed by a new
+  block of the same address ends with the `block`, and that block's expiry is still reported.
 - **Expiries are not replayed across a restart** of `serve` or of the daemon: blocks that
   expired meanwhile produce no event. The first poll after either only takes a baseline.
 - **APIBAN feed blocks fire no webhooks** (thousands per sync, and not this host's own
@@ -817,7 +820,8 @@ HEP is unauthenticated: whoever can send to the listener can get an address bloc
   is not shielded from the perimeter's own evidence, on the wire or over HEP; see "Status".)
 
 **Transports.** By default only messages that arrived over **TCP** (which covers TLS, WS and
-WSS) are judged. OpenSIPS traces its UDP traffic too, which TFPS already sees on the wire;
+WSS) are judged. OpenSIPS's `tracer` marks TLS with IP protocol 22 and WS / WSS with 50 in the
+HEP header, as stand-ins; TFPS reads 6, 22 and 50 all as TCP. OpenSIPS traces its UDP traffic too, which TFPS already sees on the wire;
 judging both would count each message twice. Add `"udp"` to `transports` only when the wire
 capture cannot see that UDP.
 

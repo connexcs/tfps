@@ -1661,7 +1661,7 @@ mod tests {
     use std::net::SocketAddr;
     use tfps::hep::{handle, Counters, Settings};
     use tfps_core::hep::build::{sip, Sip};
-    use tfps_core::hep::{IPPROTO_TCP, IPPROTO_UDP};
+    use tfps_core::hep::{IPPROTO_TCP, IPPROTO_UDP, OPENSIPS_WS};
 
     const CLIENT: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
     const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
@@ -1743,13 +1743,13 @@ mod tests {
                 hep(
                     (CLIENT, 51_234),
                     (SERVER, 443),
-                    IPPROTO_TCP,
+                    OPENSIPS_WS, // WSS, as OpenSIPS's tracer marks it in chunk 2
                     &wss_register(n),
                 ),
                 hep(
                     (SERVER, 443),
                     (CLIENT, 51_234),
-                    IPPROTO_TCP,
+                    OPENSIPS_WS,
                     &unauthorized(n),
                 ),
             ] {
