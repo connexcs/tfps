@@ -17,6 +17,18 @@ let tick = 0;
 // is dropped instead of overwriting it or reopening the token prompt.
 let generation = 0;
 let inFlight = false;
+// The block listing in flight, shared: the API serves one full listing at a
+// time (a second gets 503), so a newer refresh waits on this one instead.
+let blocksPending = null;
+
+function listing() {
+  if (!blocksPending) {
+    blocksPending = api("/v1/blocks").finally(() => {
+      blocksPending = null;
+    });
+  }
+  return blocksPending;
+}
 let windowName = "last_day";
 let lastStats = null;
 let lastBlocks = [];
@@ -141,6 +153,16 @@ function renderStatus(s) {
       ["version", s.version],
     ].map(([k, v]) => el("div", null, el("dt", null, k), el("dd", null, v)))
   );
+}
+
+// Without a status answer, enforcement is not known: say so rather than keep
+// the last answer on screen as if it were current.
+function statusUnknown() {
+  const badge = $("enforcement");
+  badge.textContent = "status unavailable";
+  badge.className = "badge bad";
+  text("k-blocked", "–");
+  fill($("status"));
 }
 
 function renderStats(st) {
@@ -283,7 +305,7 @@ async function refreshAs(gen) {
   const withBlocks = tick % BLOCKS_EVERY === 0;
   tick++;
   const jobs = [api("/v1/status"), api("/v1/stats"), api("/v1/log?limit=50")];
-  if (withBlocks) jobs.push(api("/v1/blocks"));
+  if (withBlocks) jobs.push(listing());
   const [status, stats, log, blocks] = await Promise.allSettled(jobs);
   if (gen !== generation) return; // superseded by a newer refresh
   const results = [status, stats, log, blocks].filter(Boolean);
@@ -293,7 +315,13 @@ async function refreshAs(gen) {
   }
   needToken(false);
 
-  if (status.status === "fulfilled") renderStatus(status.value);
+  if (status.status === "fulfilled") {
+    renderStatus(status.value);
+    lastUpdate = Date.now();
+  } else {
+    statusUnknown();
+  }
+  showError("status-error", status.status === "rejected" ? status.reason : null);
   if (stats.status === "fulfilled") renderStats(stats.value);
   showError("stats-error", stats.status === "rejected" ? stats.reason : null);
   if (log.status === "fulfilled") renderLog(log.value);
@@ -307,7 +335,6 @@ async function refreshAs(gen) {
     }
     showError("blocks-error", blocks.status === "rejected" ? blocks.reason : null);
   }
-  lastUpdate = Date.now();
   showUpdated();
 }
 
