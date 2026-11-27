@@ -40,6 +40,8 @@
     <p>A server between this browser and TFPS (HAProxy, nginx, Caddy…) answered
       <code>401</code> and asked for its own login, not TFPS's token. Reload the page to log in
       to it again.</p>
+    <p id="proxy-token-cleared" hidden>The TFPS token entered in this tab has been forgotten, so
+      that the reload sends the proxy's login instead.</p>
     <p>A browser sends one <code>Authorization</code> header, so a TFPS token entered here
       replaces the proxy's password login (HTTP Basic). Either leave TFPS's
       <code>token_file</code> unset and let the proxy's login guard the API, or keep both by

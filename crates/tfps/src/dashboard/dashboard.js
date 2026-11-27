@@ -321,7 +321,18 @@ function needToken(on, message) {
 // replace the proxy's login on every request), so say what to do instead.
 function needProxyLogin(on) {
   $("proxy-auth").hidden = !on;
-  if (on) $("auth").hidden = true;
+  if (!on) return;
+  $("auth").hidden = true;
+  // A stored TFPS token is sent as the Authorization header, in place of the
+  // proxy's login, on every request and after a reload: forget it, or the
+  // reload the notice asks for would be refused again the same way.
+  const had = token();
+  try {
+    sessionStorage.removeItem(TOKEN_KEY);
+  } catch (_) {
+    // nothing stored, or storage blocked: nothing to forget
+  }
+  $("proxy-token-cleared").hidden = !had;
 }
 
 async function refresh() {
