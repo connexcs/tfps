@@ -479,12 +479,11 @@ pub fn read_request<C: Conn>(c: &mut C, deadline: Instant) -> Result<Request, Re
         let continue_asked = req
             .header("expect")
             .is_some_and(|e| e.eq_ignore_ascii_case("100-continue"));
-        if continue_asked && body.is_empty() {
-            if let Some(left) = remaining(deadline) {
-                let _ = c.limit(left);
-                let _ = c.write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
-                let _ = c.flush();
-            }
+        if continue_asked
+            && body.is_empty()
+            && write_by(c, b"HTTP/1.1 100 Continue\r\n\r\n", deadline)
+        {
+            let _ = c.flush();
         }
         while body.len() < length {
             read_some(c, &mut body)?;
@@ -505,16 +504,36 @@ fn io_error_response(e: &std::io::Error) -> Response {
     }
 }
 
-/// Writes `resp` by `deadline`, a slice at a time, each bounded by the time left.
-/// A reader too slow to take it in time is abandoned rather than waited on. A
-/// listing is serialised a document at a time into a small buffer, never whole.
+/// Writes all of `bytes` by `deadline`. Every single `write` is bounded by the
+/// time left at that moment, so a reader taking a few bytes at a time cannot
+/// stretch one call past the deadline, as `write_all` with one timeout would.
+fn write_by<C: Conn>(c: &mut C, mut bytes: &[u8], deadline: Instant) -> bool {
+    while !bytes.is_empty() {
+        let Some(left) = remaining(deadline) else {
+            return false;
+        };
+        if c.limit(left).is_err() {
+            return false;
+        }
+        match c.write(bytes) {
+            Ok(0) => return false,
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
+
+/// Writes `resp` by `deadline`, a slice at a time, each write bounded by the time
+/// left. A reader too slow to take it in time is abandoned rather than waited on.
+/// A listing is serialised a document at a time into a small buffer, never whole.
 fn write_response<C: Conn>(c: &mut C, resp: &Response, deadline: Instant) {
     const SLICE: usize = 16 * 1024;
     let mut send = |bytes: &[u8]| -> bool {
-        bytes.chunks(SLICE).all(|piece| {
-            remaining(deadline)
-                .is_some_and(|left| c.limit(left).is_ok() && c.write_all(piece).is_ok())
-        })
+        bytes
+            .chunks(SLICE)
+            .all(|piece| write_by(c, piece, deadline))
     };
     if !send(&resp.head()) {
         return;
@@ -1391,6 +1410,70 @@ mod tests {
         fn limit(&mut self, _: Duration) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A reader that takes `per_write` bytes per write, each after `delay`, and
+    /// remembers every limit the server set.
+    struct Trickle {
+        per_write: usize,
+        delay: Duration,
+        written: usize,
+        limits: Vec<Duration>,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Trickle {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            std::thread::sleep(self.delay);
+            let n = buf.len().min(self.per_write);
+            self.written += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Conn for Trickle {
+        fn limit(&mut self, remaining: Duration) -> std::io::Result<()> {
+            self.limits.push(remaining);
+            Ok(())
+        }
+    }
+
+    /// A slow reader that keeps taking a few bytes is still cut off at the
+    /// deadline: the limit is set again before every write, not once per slice.
+    #[test]
+    fn a_trickling_reader_is_cut_off_at_the_deadline() {
+        let resp = Response::json(200, "x".repeat(64 * 1024));
+        let mut c = Trickle {
+            per_write: 16,
+            delay: Duration::from_millis(5),
+            written: 0,
+            limits: Vec::new(),
+        };
+        let started = Instant::now();
+        write_response(&mut c, &resp, started + Duration::from_millis(100));
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(400),
+            "abandoned near the deadline, took {took:?}"
+        );
+        assert!(c.written < 64 * 1024, "not everything was sent");
+        assert!(
+            c.limits.len() > 2,
+            "a limit before each write, not one per 16 KiB slice: {}",
+            c.limits.len()
+        );
+        assert!(
+            c.limits.windows(2).all(|w| w[1] <= w[0]),
+            "each limit is the time left, shrinking"
+        );
     }
 
     fn json(r: &Response) -> serde_json::Value {
