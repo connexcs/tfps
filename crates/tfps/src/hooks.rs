@@ -459,8 +459,11 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
     let mut watcher = Watcher::new(host_name());
     let manual_dir = crate::ctl::manual_dir(ctx);
     let cursor_file = cursor_path(ctx);
-    let mut cursor = match load_cursor(&cursor_file) {
-        Some(c) => c,
+    // `saved` is what is on disk, as far as is known: `None` until a write
+    // succeeds, so a failed write is tried again at the next idle poll instead
+    // of being forgotten.
+    let (mut cursor, mut saved) = match load_cursor(&cursor_file) {
+        Some(c) => (c.clone(), Some(c)),
         None => loop {
             // No cursor yet: start at the current end, so history is not replayed.
             match Store::open_readonly(&ctx.db).and_then(|s| s.block_log_tail()) {
@@ -470,8 +473,8 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
                         block_log_key: key,
                         manual: crate::manual_log::end_position(&manual_dir),
                     };
-                    save_or_say(&cursor_file, &c);
-                    break c;
+                    let saved = save_or_say(&cursor_file, &c).then(|| c.clone());
+                    break (c, saved);
                 }
                 Err(e) => {
                     eprintln!("tfps_ctl serve: webhooks waiting for the database: {e}");
@@ -481,7 +484,6 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
         },
     };
     let mut said = None::<String>;
-    let mut saved = cursor.clone();
     loop {
         let more = match poll_once(ctx, &manual_dir, &mut cursor, &mut watcher, &sender) {
             Ok(more) => {
@@ -498,9 +500,8 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
         };
         // Saved only when nothing is in flight: an event still queued when
         // `serve` stops is then sent again after the restart, never skipped.
-        if stats.idle() && cursor != saved {
-            save_or_say(&cursor_file, &cursor);
-            saved = cursor.clone();
+        if stats.idle() && saved.as_ref() != Some(&cursor) && save_or_say(&cursor_file, &cursor) {
+            saved = Some(cursor.clone());
         }
         if !more {
             std::thread::sleep(every);
@@ -508,9 +509,14 @@ pub fn run(ctx: &Ctx, urls: &[String], every: Duration, stats: Arc<Stats>) {
     }
 }
 
-fn save_or_say(path: &Path, cursor: &Cursor) {
-    if let Err(e) = save_cursor(path, cursor) {
-        eprintln!("tfps_ctl serve: webhooks: {e}");
+/// Writes the cursor, saying why when it cannot. Returns whether it was written.
+fn save_or_say(path: &Path, cursor: &Cursor) -> bool {
+    match save_cursor(path, cursor) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("tfps_ctl serve: webhooks: {e}");
+            false
+        }
     }
 }
 
@@ -902,7 +908,12 @@ mod tests {
             },
         };
         save_cursor(&path, &c).unwrap();
-        assert_eq!(load_cursor(&path), Some(c));
+        assert_eq!(load_cursor(&path), Some(c.clone()));
+        let _ = std::fs::remove_file(&path);
+        // A write that fails says so, so the caller keeps it unsaved and tries
+        // again rather than treating the cursor as persisted.
+        assert!(save_or_say(&path, &c));
+        assert!(!save_or_say(&path.join("not-a-directory"), &c));
         let _ = std::fs::remove_file(&path);
     }
 

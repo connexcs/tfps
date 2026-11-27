@@ -190,8 +190,8 @@ pub fn end_position(dir: &Path) -> Position {
 /// and how many lines could not be read.
 ///
 /// Only whole lines are taken: a line still being written is left for the
-/// next call. A later month's file is read from its start once the current one
-/// is done. A file shorter than `from.offset` was replaced, and is read again
+/// next call, and no later month is read until it is finished. A later month's
+/// file is read from its start once the current one is done. A file shorter than `from.offset` was replaced, and is read again
 /// from its start.
 #[must_use]
 pub fn read_after(dir: &Path, from: &Position) -> (Vec<ManualAction>, Position, usize) {
@@ -234,6 +234,11 @@ pub fn read_after(dir: &Path, from: &Position) -> (Vec<ManualAction>, Position, 
             file: name,
             offset: start + whole as u64,
         };
+        // A line still being written ends this read: moving on to a later month
+        // would carry the position past it, and it would never be read.
+        if whole < bytes.len() {
+            break;
+        }
     }
     (actions, pos, unreadable)
 }
@@ -624,6 +629,38 @@ mod tests {
         let (got, pos, bad) = read_after(&dir, &Position::default());
         assert!(got.is_empty() && bad == 1, "{got:?} {bad}");
         assert_eq!(pos, Position::default(), "not moved past November");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A month ending in a line still being written holds the read there: a
+    /// later month must not carry the position past the unfinished line.
+    #[test]
+    fn a_partial_line_holds_back_later_months() {
+        let dir = std::env::temp_dir().join(format!("tfps-manual-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        append(&dir, &[action(1_795_000_000, ManualVerb::Ban, 1)], 0o600).unwrap(); // November
+        let start = end_position(&dir);
+        let nov = dir.join(&start.file);
+        let mut f = std::fs::OpenOptions::new().append(true).open(&nov).unwrap();
+        std::io::Write::write_all(&mut f, br#"{"ts":1795000001,"action":"unban""#).unwrap();
+        append(&dir, &[action(1_797_000_000, ManualVerb::Ban, 3)], 0o600).unwrap(); // December
+        let (got, pos, bad) = read_after(&dir, &start);
+        assert!(got.is_empty() && bad == 0, "{got:?} {bad}");
+        assert_eq!(pos, start, "held at the unfinished November line");
+        std::io::Write::write_all(
+            &mut f,
+            b",\"ip\":\"203.0.113.1\",\"source\":\"x\",\"reason\":null,\"expires\":null}\n",
+        )
+        .unwrap();
+        let (got, pos, _) = read_after(&dir, &pos);
+        let verbs: Vec<_> = got.iter().map(|a| a.verb).collect();
+        assert_eq!(
+            verbs,
+            [ManualVerb::Unban, ManualVerb::Ban],
+            "November's line, then December"
+        );
+        assert_ne!(pos.file, start.file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
