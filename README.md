@@ -810,7 +810,8 @@ HEP is unauthenticated: whoever can send to the listener can get an address bloc
 - it is **off** by default and listens on **loopback** by default; a non-loopback `listen`
   is a startup `WARNING`;
 - packets from a sender not in `allow_from` are dropped and counted;
-- `auth_key` makes every packet carry that shared secret (HEP chunk 14);
+- `auth_key` makes every packet carry that shared secret (HEP chunk 14); an empty one is
+  refused and the listener does not start;
 - `ignoreip` and the host's own addresses shield HEP verdicts exactly as they shield wire
   verdicts. **An upstream proxy or load balancer must be in `ignoreip`.** (A registered peer
   is not shielded from the perimeter's own evidence, on the wire or over HEP; see "Status".)
@@ -846,10 +847,12 @@ The periodic report has a `HEP:` line, and `tfps_ctl stats`, its `--json` form a
 | `hep_stale` | captured more than 5 seconds before it arrived |
 | `hep_dropped` | the queue to the packet loop (4,096 messages or 16 MiB) was full |
 
-**Silence is an alarm.** With HEP on, if nothing arrives for **5 minutes** while TCP packets
-are seen on the SIP ports, TFPS raises an `ALARM`: the sender has stopped and TLS / WSS are
-blind again. While HEP is delivering, the "SIP over TCP it cannot inspect" warning is not
-raised. Only messages that arrived over TCP count as delivering: HEP over UDP covers no TCP.
+**Silence is an alarm, port by port.** With HEP on, if no message for a SIP port arrives for
+**5 minutes** while TCP packets are seen on that port, TFPS raises an `ALARM` naming it: the
+sender has stopped, or does not trace that port, and TLS / WSS there are blind again. While
+HEP delivers for a port, that port's TCP does not raise the "SIP over TCP it cannot inspect"
+warning. Only messages that arrived over TCP count, and only for their own port: a stream
+for 443 does not cover 5061, and HEP over UDP covers no TCP.
 
 ### Limits
 

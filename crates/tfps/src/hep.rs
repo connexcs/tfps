@@ -11,6 +11,7 @@
 //! wire, with one difference: a message that arrived over TCP has a source
 //! address the TCP handshake proved, so it is not one-way evidence.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
@@ -189,6 +190,98 @@ pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> b
             true
         }
         Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// With HEP on: no message mirrored for a port for this long, while TCP is seen
+/// on it, is an alarm. Also how long a port counts as covered after its last one.
+pub const SILENCE_SECS: u32 = 300;
+
+/// Which SIP ports' TCP the HEP stream covers, port by port.
+///
+/// The wire capture counts TCP on the SIP ports it cannot read. HEP covers a
+/// port only while messages for that port arrive over TCP: a stream for 443
+/// says nothing about 5061, and HEP over UDP covers no TCP at all.
+#[derive(Debug, Clone)]
+pub struct Coverage {
+    start: u32,
+    /// TCP packets seen on the wire, per SIP port.
+    tcp: BTreeMap<u16, u64>,
+    /// Per port: when a TCP message for it last arrived over HEP, and the wire's
+    /// TCP count for the port at that moment.
+    mirrored: BTreeMap<u16, (u32, u64)>,
+    /// Ports already alarmed about since their last HEP message.
+    alarmed: BTreeSet<u16>,
+}
+
+/// A port whose TCP is seen on the wire with no HEP message for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Silent {
+    pub port: u16,
+    /// Seconds since its last HEP message (or since start, if none).
+    pub secs: u32,
+    /// TCP packets seen on it since then.
+    pub packets: u64,
+}
+
+impl Coverage {
+    pub fn new(start: u32) -> Self {
+        Coverage {
+            start,
+            tcp: BTreeMap::new(),
+            mirrored: BTreeMap::new(),
+            alarmed: BTreeSet::new(),
+        }
+    }
+
+    /// The wire capture saw a TCP packet for SIP port `port`.
+    pub fn tcp_seen(&mut self, port: u16) {
+        *self.tcp.entry(port).or_insert(0) += 1;
+    }
+
+    /// A message for SIP port `port` arrived over HEP with TCP transport.
+    pub fn mirrored(&mut self, port: u16, now: u32) {
+        let seen = self.tcp.get(&port).copied().unwrap_or(0);
+        self.mirrored.insert(port, (now, seen));
+        self.alarmed.remove(&port);
+    }
+
+    fn covered(&self, port: u16, now: u32) -> bool {
+        self.mirrored
+            .get(&port)
+            .is_some_and(|(at, _)| now.saturating_sub(*at) < SILENCE_SECS)
+    }
+
+    /// TCP packets on ports HEP is not covering now.
+    pub fn uncovered(&self, now: u32) -> u64 {
+        self.tcp
+            .iter()
+            .filter(|(p, _)| !self.covered(**p, now))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// TCP packets on all SIP ports.
+    pub fn total(&self) -> u64 {
+        self.tcp.values().sum()
+    }
+
+    /// Ports newly silent: TCP seen on them since their last HEP message, and
+    /// none for `SILENCE_SECS`. Each is returned once until HEP covers it again.
+    pub fn newly_silent(&mut self, now: u32) -> Vec<Silent> {
+        let mut out = Vec::new();
+        for (&port, &seen) in &self.tcp {
+            let (at, seen_then) = self.mirrored.get(&port).copied().unwrap_or((self.start, 0));
+            let secs = now.saturating_sub(at);
+            if seen > seen_then && secs >= SILENCE_SECS && self.alarmed.insert(port) {
+                out.push(Silent {
+                    port,
+                    secs,
+                    packets: seen - seen_then,
+                });
+            }
+        }
+        out
     }
 }
 
@@ -425,6 +518,56 @@ mod tests {
         assert!(inbox.try_recv().is_some());
         assert!(offer(&tx, big, &c), "room again once one is taken");
         assert_eq!(count(&c, "hep_sip"), fits as u64 + 1);
+    }
+
+    #[test]
+    fn coverage_is_per_port_and_alarms_once_per_silence() {
+        let start = 1_000;
+        let mut c = Coverage::new(start);
+        for _ in 0..3 {
+            c.tcp_seen(443);
+            c.tcp_seen(5061);
+        }
+        assert_eq!((c.total(), c.uncovered(start)), (6, 6));
+        // 443 is mirrored; 5061 is not.
+        c.mirrored(443, start + 10);
+        assert_eq!(c.uncovered(start + 20), 3, "only 5061 is uncovered");
+        let silent = c.newly_silent(start + SILENCE_SECS);
+        assert_eq!(
+            silent,
+            [Silent {
+                port: 5061,
+                secs: SILENCE_SECS,
+                packets: 3
+            }],
+            "443's stream does not hide 5061"
+        );
+        assert!(c.newly_silent(start + SILENCE_SECS + 60).is_empty(), "once");
+        // 443 goes quiet while its TCP continues.
+        c.tcp_seen(443);
+        let later = start + 10 + SILENCE_SECS;
+        assert_eq!(c.uncovered(later), 7, "443 no longer counts as covered");
+        assert_eq!(c.newly_silent(later)[0].port, 443);
+        // HEP for 5061 resumes: covered again, and it can alarm again later.
+        c.mirrored(5061, later);
+        assert_eq!(c.uncovered(later), 4);
+        c.tcp_seen(5061);
+        assert_eq!(
+            c.newly_silent(later + SILENCE_SECS)[0],
+            Silent {
+                port: 5061,
+                secs: SILENCE_SECS,
+                packets: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_port_with_no_tcp_never_alarms() {
+        let mut c = Coverage::new(0);
+        c.mirrored(443, 0);
+        assert!(c.newly_silent(SILENCE_SECS * 10).is_empty());
+        assert_eq!(c.uncovered(SILENCE_SECS * 10), 0);
     }
 
     /// The real socket: bind, send from loopback, receive on the channel.

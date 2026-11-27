@@ -193,6 +193,18 @@ impl Default for HepConfig {
     }
 }
 
+impl HepConfig {
+    /// A setting that would make the listener less safe than it says it is, or
+    /// `None`. An empty `auth_key` would be announced as "required" while any
+    /// packet with an empty chunk 14 passes it, so it is refused, not ignored.
+    pub fn problem(&self) -> Option<String> {
+        self.auth_key
+            .as_deref()
+            .is_some_and(str::is_empty)
+            .then(|| "`hep.auth_key` is empty; remove it, or set a real secret".to_string())
+    }
+}
+
 fn default_hep_listen() -> SocketAddrV4 {
     DEFAULT_HEP_LISTEN
 }
@@ -520,6 +532,19 @@ mod tests {
         assert_eq!(h.allow_from.len(), 2);
         assert_eq!(h.transports, [HepTransport::Tcp, HepTransport::Udp]);
         assert_eq!(h.auth_key.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn an_empty_hep_auth_key_is_a_problem_not_a_secret() {
+        let with = |key: &str| {
+            parse(&format!(r#"{{"hep": {{"auth_key": {key}}}}}"#))
+                .expect("parses")
+                .hep
+                .expect("present")
+        };
+        assert!(with("\"\"").problem().is_some(), "empty");
+        assert!(with("\"s3cret\"").problem().is_none());
+        assert!(with("null").problem().is_none(), "absent is not a problem");
     }
 
     #[test]

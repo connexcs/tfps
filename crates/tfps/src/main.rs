@@ -46,10 +46,6 @@ const ETH_P_IP_BE: i32 = 0x0008;
 /// A generous MTU: SIP over UDP rarely exceeds this, and what does gets fragmented.
 const BUF: usize = 65_536;
 
-/// With HEP on: no mirrored message for this long, while TCP is seen on the SIP
-/// ports, is an alarm. Also how long HEP counts as delivering after its last message.
-const HEP_SILENCE_SECS: u32 = 300;
-
 struct Args {
     ports: Vec<u16>,
     intl_prefixes: Vec<String>,
@@ -669,7 +665,13 @@ fn main() -> ExitCode {
             if h.transports.is_empty() {
                 eprintln!("WARNING: HEP `transports` is empty: every mirrored message is skipped");
             }
-            match tfps::hep::spawn(h, Arc::clone(&hep_counters)) {
+            // Fail closed: a listener weaker than its configuration claims is
+            // worse than none, and this one is announced loudly.
+            let started = match h.problem() {
+                Some(p) => Err(std::io::Error::other(p)),
+                None => tfps::hep::spawn(h, Arc::clone(&hep_counters)),
+            };
+            match started {
                 Ok((rx, addr)) => {
                     say!(
                         "  HEP input         : UDP {addr}, from {:?}, transports {:?}{}",
@@ -685,7 +687,7 @@ fn main() -> ExitCode {
                 }
                 Err(e) => {
                     eprintln!(
-                        "ALARM: the HEP listener could not bind {}: {e}. SIP over TLS and \
+                        "ALARM: the HEP listener on {} did not start: {e}. SIP over TLS and \
                          WebSocket will NOT be inspected.",
                         h.listen
                     );
@@ -815,10 +817,7 @@ fn main() -> ExitCode {
     };
     // HEP's own alarms: silence while TCP is seen on the SIP ports, and a
     // mirrored port that XDP does not cover.
-    let mut hep_last = start.0;
-    let mut hep_ever = false;
-    let mut tcp_at_hep_last = 0u64;
-    let mut hep_silence_warned = false;
+    let mut coverage = tfps::hep::Coverage::new(start.0);
     let mut hep_port_warned = std::collections::BTreeSet::new();
 
     loop {
@@ -850,8 +849,11 @@ fn main() -> ExitCode {
                     // the administrator's own SSH session, turning the warning into noise.
                     NotUdp::Tcp => {
                         if let Some((sp, dp)) = tcp_ports(&buf[..n]) {
-                            if args.ports.contains(&sp) || args.ports.contains(&dp) {
+                            // The SIP port: where it went, or where it came from.
+                            let port = [dp, sp].into_iter().find(|p| args.ports.contains(p));
+                            if let Some(port) = port {
                                 n_tcp += 1;
+                                coverage.tcp_seen(port);
                             }
                         }
                     }
@@ -910,19 +912,15 @@ fn main() -> ExitCode {
         // cannot starve the wire capture.
         if let Some(inbox) = hep_rx.as_ref() {
             for m in std::iter::from_fn(|| inbox.try_recv()).take(tfps::hep::QUEUE) {
-                // Only TCP mirrors cover the wire's TCP blind spot: HEP over UDP,
-                // when accepted, neither suppresses that warning nor resets the
-                // silence alarm.
-                if m.transport == tfps_core::hep::Transport::Tcp {
-                    hep_last = t.0;
-                    hep_ever = true;
-                    tcp_at_hep_last = n_tcp;
-                    hep_silence_warned = false;
-                }
                 // The server's side of the exchange: where a request went, or where
                 // an answer came from.
                 let is_response = m.payload.starts_with(b"SIP/2.0 ");
                 let server_port = if is_response { m.src_port } else { m.dst_port };
+                // Only a TCP mirror for a port covers that port's TCP on the wire:
+                // HEP over UDP, or with no port, covers nothing.
+                if let (Some(port), tfps_core::hep::Transport::Tcp) = (server_port, m.transport) {
+                    coverage.mirrored(port, t.0);
+                }
                 if let Some(port) = server_port {
                     *seen_ports.entry(port).or_insert(0) += 1;
                     if !args.ports.contains(&port) && hep_port_warned.insert(port) {
@@ -1123,34 +1121,32 @@ fn main() -> ExitCode {
                         .collect::<Vec<_>>()
                         .join(" ")
                 );
-                // Silence is an alarm: TCP on the SIP ports and nothing mirrored
-                // means the sender stopped, and TLS / WebSocket are blind again.
-                if n_tcp > tcp_at_hep_last
-                    && t.0.saturating_sub(hep_last) >= HEP_SILENCE_SECS
-                    && !hep_silence_warned
-                {
+                // Silence is an alarm, port by port: TCP on a SIP port and nothing
+                // mirrored for it means TLS / WebSocket there are blind again.
+                for s in coverage.newly_silent(t.0) {
                     eprintln!(
-                        "ALARM: no HEP message in {}s while {} TCP packets were seen on ports \
-                         {:?}. SIP over TLS and WebSocket is NOT being inspected; check the \
-                         application server's HEP tracing.",
-                        t.0.saturating_sub(hep_last),
-                        n_tcp - tcp_at_hep_last,
-                        args.ports
+                        "ALARM: no HEP message for port {} in {}s while {} TCP packets were \
+                         seen on it. SIP over TLS and WebSocket there is NOT being inspected; \
+                         check the application server's HEP tracing.",
+                        s.port, s.secs, s.packets
                     );
-                    hep_silence_warned = true;
                 }
             }
-            // TCP is covered while HEP is delivering: the mirrored messages are
-            // that TCP's SIP.
-            let hep_delivering = hep_ever && t.0.saturating_sub(hep_last) < HEP_SILENCE_SECS;
-            let tcp_blind = if hep_delivering { 0 } else { n_tcp };
+            // A port's TCP is covered while HEP delivers messages for that port:
+            // they are that TCP's SIP.
+            let tcp_blind = if hep_rx.is_some() {
+                coverage.uncovered(t.0)
+            } else {
+                n_tcp
+            };
             if n_ipv6 + n_tcp > 0 {
+                let covered = n_tcp.saturating_sub(tcp_blind);
                 say!(
                     "    blind spots: ipv6={n_ipv6} tcp={n_tcp}{} fragments={n_frag}",
-                    if hep_delivering {
-                        " (covered by HEP)"
+                    if covered > 0 {
+                        format!(" ({covered} covered by HEP)")
                     } else {
-                        ""
+                        String::new()
                     }
                 );
             }
