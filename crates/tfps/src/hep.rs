@@ -194,17 +194,22 @@ pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> b
         return true;
     }
     counters.queued_bytes.fetch_add(len, Ordering::AcqRel);
+    // Counted before it is handed over, and taken back if it is not: once the
+    // main loop holds a message, its count is already there to read.
+    Counters::bump(&counters.sip);
     match tx.try_send(m) {
-        Ok(()) => {
-            Counters::bump(&counters.sip);
-            true
-        }
+        Ok(()) => true,
         Err(TrySendError::Full(_)) => {
+            counters.sip.fetch_sub(1, Ordering::Relaxed);
             counters.queued_bytes.fetch_sub(len, Ordering::AcqRel);
             Counters::bump(&counters.dropped);
             true
         }
-        Err(TrySendError::Disconnected(_)) => false,
+        Err(TrySendError::Disconnected(_)) => {
+            counters.sip.fetch_sub(1, Ordering::Relaxed);
+            counters.queued_bytes.fetch_sub(len, Ordering::AcqRel);
+            false
+        }
     }
 }
 
@@ -506,7 +511,14 @@ mod tests {
         assert_eq!(count(&c, "hep_sip"), 1);
         assert_eq!(count(&c, "hep_dropped"), 1);
         drop(rx);
+        let queued = c.queued_bytes.load(Ordering::Acquire);
         assert!(!offer(&tx, m, &c), "the main loop is gone");
+        assert_eq!(count(&c, "hep_sip"), 1, "not counted as handed over");
+        assert_eq!(
+            c.queued_bytes.load(Ordering::Acquire),
+            queued,
+            "nor as queued"
+        );
     }
 
     /// Large messages fill the byte budget before the message count, and

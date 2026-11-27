@@ -112,7 +112,7 @@ td.when { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .empty { color: var(--muted); padding: 12px 0; }
 .error { color: var(--bad-fg); margin: 8px 0 0; }
 /* The API stopped answering (a token is needed): everything but the prompt is old. */
-body.stale main > :not(#auth) { opacity: 0.45; }
+body.stale main > :not(#auth):not(#proxy-auth) { opacity: 0.45; }
 footer { text-align: center; padding: 8px 20px 24px; font-size: 12px; }
 @media (max-width: 520px) {
   main { padding: 12px; gap: 12px; }
