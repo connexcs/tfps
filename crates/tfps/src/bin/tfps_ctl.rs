@@ -350,7 +350,7 @@ fn stats(args: &Args) -> Result<(), String> {
                 .filter_map(|kv| kv.split_once('='))
                 .collect();
             for row in pairs.chunks(2) {
-                let cell = |(k, v): &(&str, &str)| format!("{k:<16} {v:>10}");
+                let cell = |(k, v): &(&str, &str)| format!("{k:<19} {v:>10}");
                 say!(
                     "  {}   {}",
                     cell(&row[0]),

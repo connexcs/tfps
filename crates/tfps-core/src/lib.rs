@@ -11,6 +11,7 @@ pub mod country;
 pub mod dialplan;
 pub mod disposition;
 pub mod engine;
+pub mod hep;
 pub mod ignore;
 pub mod net;
 pub mod novelty;

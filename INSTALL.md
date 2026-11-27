@@ -96,6 +96,11 @@ set `token_file` (owner-readable only); to listen beyond loopback, set `allow_re
 `systemctl enable --now tfps-api` (or `systemctl restart tfps-api` after editing them).
 Read the README's "JSON API" section, its security model in particular, before exposing it.
 
+**HEP input** (SIP over TLS and WebSocket mirrored from OpenSIPS on the same host, README
+"TLS and WebSocket via HEP") is read by the daemon itself: set `"hep": {"enabled": true}`,
+add the TLS / WSS ports (for example `5061`, `443`) to `ports`, then `systemctl restart tfps`.
+It listens on `127.0.0.1:9061` and accepts only `127.0.0.1` unless `allow_from` says otherwise.
+
 ## Pinning a version
 
 ```sh

@@ -1,0 +1,379 @@
+//! The daemon's HEP3 listener: the decrypted SIP an application server mirrors.
+//!
+//! It runs on its own thread, like APIBAN, so the packet loop never waits on it.
+//! The thread reads the socket, drops senders that are not allowed, parses and
+//! filters each packet (`tfps_core::hep`), and hands what passes to the main loop
+//! over a **bounded** channel. When the main loop falls behind, a message is
+//! dropped and counted rather than queued without limit: HEP must never slow the
+//! wire capture down.
+//!
+//! The main loop then judges each message exactly as it judges a packet off the
+//! wire, with one difference: a message that arrived over TCP has a source
+//! address the TCP handshake proved, so it is not one-way evidence.
+
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use tfps_core::hep::{classify, parse, Filter, Skip, Transport};
+
+use crate::config::{HepConfig, HepTransport};
+
+/// How many messages may wait for the main loop. At a few hundred bytes each
+/// this bounds the queue to a few MiB.
+pub const QUEUE: usize = 4096;
+
+/// A message captured more than this many seconds before it arrived is stale: a
+/// replayed backlog must not trigger blocks for behaviour that is over.
+pub const STALE_SECS: u32 = 5;
+
+/// One mirrored SIP message, for the main loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivered {
+    pub src: Ipv4Addr,
+    pub dst: Ipv4Addr,
+    pub src_port: Option<u16>,
+    pub dst_port: Option<u16>,
+    pub transport: Transport,
+    pub payload: Vec<u8>,
+}
+
+/// What the listener has done, shared with the main loop for its reports.
+#[derive(Debug, Default)]
+pub struct Counters {
+    /// Datagrams read from the socket.
+    pub received: AtomicU64,
+    /// Messages handed to the engine.
+    pub sip: AtomicU64,
+    pub rejected_sender: AtomicU64,
+    pub bad_auth: AtomicU64,
+    pub malformed: AtomicU64,
+    pub skipped_udp: AtomicU64,
+    pub skipped_tcp: AtomicU64,
+    pub skipped_ipv6: AtomicU64,
+    pub skipped_proto: AtomicU64,
+    pub stale: AtomicU64,
+    /// Dropped because the queue to the main loop was full.
+    pub dropped: AtomicU64,
+}
+
+impl Counters {
+    /// Every counter, named as in the daemon's checkpointed stats line.
+    pub fn snapshot(&self) -> [(&'static str, u64); 11] {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        [
+            ("hep_received", g(&self.received)),
+            ("hep_sip", g(&self.sip)),
+            ("hep_rejected_sender", g(&self.rejected_sender)),
+            ("hep_bad_auth", g(&self.bad_auth)),
+            ("hep_malformed", g(&self.malformed)),
+            ("hep_skipped_udp", g(&self.skipped_udp)),
+            ("hep_skipped_tcp", g(&self.skipped_tcp)),
+            ("hep_skipped_ipv6", g(&self.skipped_ipv6)),
+            ("hep_skipped_proto", g(&self.skipped_proto)),
+            ("hep_stale", g(&self.stale)),
+            ("hep_dropped", g(&self.dropped)),
+        ]
+    }
+
+    fn bump(c: &AtomicU64) {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The listener's settings, taken from the configuration once.
+#[derive(Debug, Clone)]
+pub struct Settings {
+    pub allow_from: Vec<Ipv4Addr>,
+    pub tcp: bool,
+    pub udp: bool,
+    pub auth_key: Option<Vec<u8>>,
+}
+
+impl Settings {
+    pub fn from_config(c: &HepConfig) -> Self {
+        Settings {
+            allow_from: c.allow_from.clone(),
+            tcp: c.transports.contains(&HepTransport::Tcp),
+            udp: c.transports.contains(&HepTransport::Udp),
+            auth_key: c.auth_key.as_ref().map(|k| k.as_bytes().to_vec()),
+        }
+    }
+}
+
+/// Judges one datagram from `sender`, counting what happened to it. Returns the
+/// message when it should reach the engine.
+pub fn handle(
+    datagram: &[u8],
+    sender: SocketAddr,
+    s: &Settings,
+    now: u32,
+    counters: &Counters,
+) -> Option<Delivered> {
+    Counters::bump(&counters.received);
+    let allowed = match sender {
+        SocketAddr::V4(a) => s.allow_from.contains(a.ip()),
+        SocketAddr::V6(a) => a
+            .ip()
+            .to_ipv4_mapped()
+            .is_some_and(|ip| s.allow_from.contains(&ip)),
+    };
+    if !allowed {
+        Counters::bump(&counters.rejected_sender);
+        return None;
+    }
+    let Ok(hep) = parse(datagram) else {
+        Counters::bump(&counters.malformed);
+        return None;
+    };
+    let filter = Filter {
+        tcp: s.tcp,
+        udp: s.udp,
+        auth_key: s.auth_key.as_deref(),
+        now,
+        stale_secs: STALE_SECS,
+    };
+    match classify(&hep, &filter) {
+        Ok(m) => Some(Delivered {
+            src: m.src,
+            dst: m.dst,
+            src_port: m.src_port,
+            dst_port: m.dst_port,
+            transport: m.transport,
+            payload: m.payload.to_vec(),
+        }),
+        Err(skip) => {
+            Counters::bump(match skip {
+                Skip::BadAuth => &counters.bad_auth,
+                Skip::Ipv6 => &counters.skipped_ipv6,
+                Skip::Proto | Skip::Compressed => &counters.skipped_proto,
+                Skip::Udp => &counters.skipped_udp,
+                Skip::Tcp => &counters.skipped_tcp,
+                Skip::Stale => &counters.stale,
+                Skip::Incomplete => &counters.malformed,
+            });
+            None
+        }
+    }
+}
+
+/// Offers a message to the main loop without waiting. Counts it as handed over,
+/// or as dropped when the queue is full. Returns false when the main loop is gone.
+pub fn offer(tx: &SyncSender<Delivered>, m: Delivered, counters: &Counters) -> bool {
+    match tx.try_send(m) {
+        Ok(()) => {
+            Counters::bump(&counters.sip);
+            true
+        }
+        Err(TrySendError::Full(_)) => {
+            Counters::bump(&counters.dropped);
+            true
+        }
+        Err(TrySendError::Disconnected(_)) => false,
+    }
+}
+
+/// Binds the listener and starts its thread. A bind failure is returned, so the
+/// daemon can say so at startup instead of running without the input it was
+/// configured to have.
+pub fn spawn(
+    c: &HepConfig,
+    counters: Arc<Counters>,
+) -> std::io::Result<(Receiver<Delivered>, SocketAddr)> {
+    let sock = UdpSocket::bind(c.listen)?;
+    let local = sock.local_addr()?;
+    let settings = Settings::from_config(c);
+    let (tx, rx) = mpsc::sync_channel(QUEUE);
+    std::thread::Builder::new()
+        .name("tfps-hep".into())
+        .spawn(move || {
+            let mut buf = vec![0u8; 65_535];
+            loop {
+                let (n, sender) = match sock.recv_from(&mut buf) {
+                    Ok(r) => r,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) => {
+                        eprintln!("ALARM: HEP listener stopped: {e}");
+                        return;
+                    }
+                };
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs() as u32)
+                    .unwrap_or(0);
+                if let Some(m) = handle(&buf[..n], sender, &settings, now, &counters) {
+                    if !offer(&tx, m, &counters) {
+                        return; // the main loop is gone
+                    }
+                }
+            }
+        })?;
+    Ok((rx, local))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tfps_core::hep::build::{sip, Sip};
+    use tfps_core::hep::{IPPROTO_TCP, IPPROTO_UDP};
+
+    const CLIENT: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+    const SERVER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 10);
+    const NOW: u32 = 1_795_000_000;
+
+    fn loopback() -> SocketAddr {
+        "127.0.0.1:40000".parse().unwrap()
+    }
+
+    fn packet(ip_proto: u8, ts: u32, key: Option<&str>) -> Vec<u8> {
+        sip(&Sip {
+            src: (CLIENT, 51_234),
+            dst: (SERVER, 5061),
+            ip_proto,
+            ts,
+            auth_key: key,
+            payload: b"OPTIONS sip:x SIP/2.0\r\n\r\n",
+        })
+    }
+
+    fn settings() -> Settings {
+        Settings::from_config(&HepConfig::default())
+    }
+
+    fn count(c: &Counters, name: &str) -> u64 {
+        c.snapshot()
+            .iter()
+            .find(|(n, _)| *n == name)
+            .map(|(_, v)| *v)
+            .expect(name)
+    }
+
+    #[test]
+    fn a_tcp_message_from_loopback_is_delivered() {
+        let c = Counters::default();
+        let m = handle(
+            &packet(IPPROTO_TCP, NOW, None),
+            loopback(),
+            &settings(),
+            NOW,
+            &c,
+        )
+        .expect("delivered");
+        assert_eq!((m.src, m.dst), (CLIENT, SERVER));
+        assert_eq!(m.transport, Transport::Tcp);
+        assert_eq!(m.dst_port, Some(5061));
+        assert_eq!(count(&c, "hep_received"), 1);
+    }
+
+    #[test]
+    fn a_sender_not_allowed_is_dropped_and_counted() {
+        let c = Counters::default();
+        let stranger: SocketAddr = "192.0.2.9:40000".parse().unwrap();
+        assert!(handle(
+            &packet(IPPROTO_TCP, NOW, None),
+            stranger,
+            &settings(),
+            NOW,
+            &c
+        )
+        .is_none());
+        assert_eq!(count(&c, "hep_rejected_sender"), 1);
+        // An IPv4 sender seen through a dual-stack socket is still itself.
+        let mapped: SocketAddr = "[::ffff:127.0.0.1]:40000".parse().unwrap();
+        assert!(handle(
+            &packet(IPPROTO_TCP, NOW, None),
+            mapped,
+            &settings(),
+            NOW,
+            &c
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn each_refusal_has_its_counter() {
+        let c = Counters::default();
+        let keyed = Settings {
+            auth_key: Some(b"s3cret".to_vec()),
+            ..settings()
+        };
+        let lo = loopback();
+        assert!(handle(
+            &packet(IPPROTO_TCP, NOW, Some("wrong")),
+            lo,
+            &keyed,
+            NOW,
+            &c
+        )
+        .is_none());
+        assert!(handle(
+            &packet(IPPROTO_TCP, NOW, Some("s3cret")),
+            lo,
+            &keyed,
+            NOW,
+            &c
+        )
+        .is_some());
+        assert!(handle(&packet(IPPROTO_UDP, NOW, None), lo, &settings(), NOW, &c).is_none());
+        assert!(handle(
+            &packet(IPPROTO_TCP, NOW - 60, None),
+            lo,
+            &settings(),
+            NOW,
+            &c
+        )
+        .is_none());
+        assert!(handle(b"HEP3\x00\x05", lo, &settings(), NOW, &c).is_none());
+        assert_eq!(count(&c, "hep_bad_auth"), 1);
+        assert_eq!(count(&c, "hep_skipped_udp"), 1);
+        assert_eq!(count(&c, "hep_stale"), 1);
+        assert_eq!(count(&c, "hep_malformed"), 1);
+        assert_eq!(count(&c, "hep_received"), 5);
+    }
+
+    #[test]
+    fn a_full_queue_drops_and_counts_without_waiting() {
+        let c = Counters::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        let m = handle(
+            &packet(IPPROTO_TCP, NOW, None),
+            loopback(),
+            &settings(),
+            NOW,
+            &c,
+        )
+        .unwrap();
+        assert!(offer(&tx, m.clone(), &c));
+        assert!(offer(&tx, m.clone(), &c), "full is not an error");
+        assert_eq!(count(&c, "hep_sip"), 1);
+        assert_eq!(count(&c, "hep_dropped"), 1);
+        drop(rx);
+        assert!(!offer(&tx, m, &c), "the main loop is gone");
+    }
+
+    /// The real socket: bind, send from loopback, receive on the channel.
+    #[test]
+    fn the_listener_receives_over_udp() {
+        let cfg = HepConfig {
+            enabled: true,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            ..HepConfig::default()
+        };
+        let counters = Arc::new(Counters::default());
+        let (rx, addr) = spawn(&cfg, Arc::clone(&counters)).expect("binds");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as u32;
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .send_to(&packet(IPPROTO_TCP, now, None), addr)
+            .unwrap();
+        let m = rx.recv_timeout(Duration::from_secs(5)).expect("delivered");
+        assert_eq!(m.src, CLIENT);
+        assert_eq!(count(&counters, "hep_sip"), 1);
+    }
+}
